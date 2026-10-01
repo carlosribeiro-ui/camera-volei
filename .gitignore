@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+
+# dados locais de cada computador
+config.json
+*.log
+
+# vídeos (grandes demais para o git)
+cortes/
+partidas/
+videos_teste/
+*.mp4

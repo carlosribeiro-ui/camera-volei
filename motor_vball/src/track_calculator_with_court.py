@@ -1,0 +1,2600 @@
+#!/usr/bin/env python3
+"""Track calculation with court-aware rally vs technical-return analysis."""
+
+from __future__ import annotations
+
+import argparse
+import cv2
+import json
+import logging
+import math
+import os
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Sequence
+
+import numpy as np
+import pandas as pd
+
+from ball_tracker import BallTracker, Track
+from constants import (
+    BEACH_COURT_LENGTH_M,
+    BEACH_COURT_WIDTH_M,
+    COURT_LENGTH_M,
+    COURT_WIDTH_M,
+    DEFAULT_BOUNCE_FRAMES,
+    DEFAULT_DETECTION_BOX_RADIUS,
+    DEFAULT_FPS,
+    DEFAULT_MAX_DISTANCE,
+    DEFAULT_MAX_X_DISPLACEMENT,
+    DEFAULT_MIN_DURATION_SEC,
+    DEFAULT_MIN_Y_DISPLACEMENT,
+    DEFAULT_NET_Y_THRESHOLD,
+)
+from court_transformer import CoordinateTransformer, CourtTransformer
+from models import CourtGeometry
+from player_contacts import (
+    DEFAULT_BALL_SCORE_THRESHOLD,
+    DEFAULT_PLAYER_SCORE_THRESHOLD,
+    EMPTY_CONTACT_SUMMARY,
+    MAX_REACH_RATIO,
+    PLAYER_HEIGHT_CM,
+    BallSample,
+    ContactDetector,
+    PlayerStore,
+    summarize_contacts,
+)
+
+LOG = logging.getLogger(__name__)
+
+REFERENCE_VIDEO_WIDTH = 1920.0
+NET_HEIGHT_CM = 243.0
+BALL_DIAMETER_CM = 21.0
+BALL_SIZE_WINDOW = 6
+MAX_MERGE_GAP_FRAMES = 40
+MAX_AIRBORNE_REENTRY_GAP_SECONDS = 3.0
+# A ball that flew out of the top of the frame must come back where its exit
+# velocity puts it, and fall roughly as fast as it rose.
+REENTRY_MIN_TOLERANCE_PX = 90.0
+REENTRY_TOLERANCE_WIDTH_RATIO = 0.07
+REENTRY_TOLERANCE_DRIFT_RATIO = 0.35
+REENTRY_MIN_SPEED_RATIO = 0.45
+REENTRY_MAX_SPEED_RATIO = 2.2
+POST_PAUSE_TAIL_SECONDS = 0.5
+MIN_EFFECTIVE_SCOPE_M = 0.45
+MIN_EFFECTIVE_SCOPE_PX = 14.0
+
+# Replacing a CSV detection with the players-model ball needs both a large
+# error against the neighboring frames and a clearly better alternative.
+BALL_REPAIR_MIN_ERROR_PX = 35.0
+BALL_REPAIR_ERROR_RATIO = 2.0
+BALL_REPAIR_NEIGHBOR_FRAMES = 4
+# Only dropouts inside a flight are filled: an isolated detection during a
+# pause would stitch a technical return to the rally that follows it.
+BALL_FILL_NEIGHBOR_FRAMES = 8
+# The filled ball must also lie near the flight between those detections:
+# a second ball (warm-up, in a player's hands) sits far off the chord. A touch
+# inside the gap bends the path, so the tolerance grows with the chord.
+BALL_FILL_MIN_TOLERANCE_PX = 45.0
+BALL_FILL_TOLERANCE_CHORD_RATIO = 0.35
+
+# Two tracks separated by a short blind spot at a player are one rally: the
+# touch reverses the ball, so the tracker cannot bridge the gap on its own.
+CONTACT_SPLIT_MAX_GAP_SECONDS = 0.5
+CONTACT_SPLIT_MIN_DISTANCE_PX = 80.0
+
+# If neither detector sees the ball for that long, it is not in flight - the
+# episode ends there instead of stretching over the pause.
+BLIND_GAP_SECONDS = 0.8
+
+# Detections of a model run on every n-th frame (--frame_step of the players
+# model). Above this the step is treated as dropouts, not as sampling.
+MAX_BALL_FRAME_STEP = 4
+
+
+def is_foreign_court_trajectory(features: dict[str, Any]) -> bool:
+    """Return true when the ball flight belongs to a neighbouring court.
+
+    ``crosses_net`` cannot be used here: that feature currently means that the
+    track has observations after its last above-net point, not that it crossed
+    the main court's net.  A neighbouring-court arc can therefore set it too.
+    """
+    return (
+        float(features.get("outside_main_court_corridor_ratio", 0.0)) >= 0.90
+        and int(features.get("contact_count", 0)) == 0
+        and float(features.get("player_box_coverage", 0.0)) >= 0.25
+        and float(features.get("near_player_frame_ratio", 0.0)) <= 0.05
+    )
+
+
+def court_ball_motion(
+    positions: Sequence[tuple[int, float, float]],
+    max_gap_frames: int = 8,
+) -> dict[int, tuple[float, float]]:
+    """Smoothed outgoing court-plane vectors for ball direction arrows."""
+    result: dict[int, tuple[float, float]] = {}
+    for index, (frame, x, y) in enumerate(positions):
+        future = [
+            item
+            for item in positions[index + 1 :]
+            if 0 < item[0] - frame <= max_gap_frames
+        ]
+        if future:
+            first = (frame, x, y)
+            last = future[-1]
+        else:
+            past = [
+                item
+                for item in positions[:index]
+                if 0 < frame - item[0] <= max_gap_frames
+            ]
+            if not past:
+                continue
+            first = past[0]
+            last = (frame, x, y)
+        span = last[0] - first[0]
+        if span <= 0:
+            continue
+        result[int(frame)] = (
+            float((last[1] - first[1]) / span),
+            float((last[2] - first[2]) / span),
+        )
+    return result
+
+
+def stabilize_court_ball_positions(
+    raw_positions: Sequence[tuple[int, float, float]],
+    reach_anchors: dict[int, tuple[float, float, int]],
+    max_anchor_span_frames: int = 180,
+) -> list[tuple[int, float, float, str, Optional[int]]]:
+    """Approximate an airborne ball using player-ground anchors.
+
+    A planar homography sends an airborne image point far outside the court.
+    Player feet do lie on the plane, so interpolate between frames where the
+    ball is within a player's reach and retain raw homography as a fallback.
+    """
+    if not reach_anchors:
+        return [(frame, x, y, "homography", None) for frame, x, y in raw_positions]
+
+    anchor_frames = sorted(reach_anchors)
+    result: list[tuple[int, float, float, str, Optional[int]]] = []
+    for frame, raw_x, raw_y in raw_positions:
+        exact = reach_anchors.get(frame)
+        if exact is not None:
+            result.append((frame, exact[0], exact[1], "player_reach", exact[2]))
+            continue
+
+        previous = next((item for item in reversed(anchor_frames) if item < frame), None)
+        following = next((item for item in anchor_frames if item > frame), None)
+        if (
+            previous is not None
+            and following is not None
+            and following - previous <= max_anchor_span_frames
+        ):
+            first = reach_anchors[previous]
+            last = reach_anchors[following]
+            weight = (frame - previous) / float(following - previous)
+            result.append(
+                (
+                    frame,
+                    float(first[0] + (last[0] - first[0]) * weight),
+                    float(first[1] + (last[1] - first[1]) * weight),
+                    "interpolated_player_reach",
+                    None,
+                )
+            )
+            continue
+        result.append((frame, raw_x, raw_y, "homography", None))
+    return result
+
+
+@dataclass(frozen=True)
+class TrackCalculatorConfig:
+    csv_path: Optional[str]
+    output_dir: str
+    fps: float
+    max_distance: float
+    min_duration_sec: float
+    max_x_displacement: float
+    min_y_displacement: float
+    bounce_frames: int
+    court_json_path: Optional[str]
+    video_width: Optional[int]
+    video_height: Optional[int]
+    beach: bool
+    players_json_path: Optional[str] = None
+    player_score_threshold: float = DEFAULT_PLAYER_SCORE_THRESHOLD
+    ball_score_threshold: float = DEFAULT_BALL_SCORE_THRESHOLD
+    use_player_ball: bool = True
+
+
+@dataclass(frozen=True)
+class FrameObservation:
+    frame: int
+    x: float
+    y: float
+    radius_px: Optional[float]
+    smoothed_radius_px: Optional[float]
+    visibility: float
+
+
+@dataclass(frozen=True)
+class BallSizeFeatures:
+    radius_med_px: Optional[float]
+    diameter_med_px: Optional[float]
+    ball_cm_per_px: Optional[float]
+    effective_scope_px: float
+    effective_scope_m: float
+
+
+@dataclass(frozen=True)
+class CsvSizeCalibration:
+    radius_lower_px: Optional[float]
+    radius_upper_px: Optional[float]
+    radius_median_px: Optional[float]
+    radius_near_far_threshold_px: Optional[float]
+    filtered_count: int
+
+
+@dataclass
+class TrackAnalysisRecord:
+    track: Track
+    observations: list[FrameObservation]
+    trajectory_analysis: dict[str, Any]
+    rally_features: dict[str, Any]
+    rally_classification: dict[str, Any]
+    state_before: dict[str, Any]
+    state_after: dict[str, Any]
+    player_interaction: dict[str, Any]
+    score_event: Optional[dict[str, Any]] = None
+
+
+def setup_logging(verbose: bool) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+
+
+GENERIC_SOURCE_NAMES = ("ball", "players", "predictions")
+SOURCE_NAME_SUFFIXES = ("_predict_ball", "_ball", "_predictions", "_players")
+
+
+def resolve_video_basename(source_path: str) -> str:
+    """Video name behind a ball CSV or a players-JSON path."""
+    name = os.path.splitext(os.path.basename(source_path))[0]
+    parent = os.path.basename(os.path.dirname(source_path))
+
+    if name in GENERIC_SOURCE_NAMES and parent:
+        return parent
+    for suffix in SOURCE_NAME_SUFFIXES:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+class CourtContext:
+    """Stores court geometry, camera classification and coordinate transforms."""
+
+    def __init__(self, config: TrackCalculatorConfig) -> None:
+        self._court_length_m = BEACH_COURT_LENGTH_M if config.beach else COURT_LENGTH_M
+        self._court_width_m = BEACH_COURT_WIDTH_M if config.beach else COURT_WIDTH_M
+        self._geometry: Optional[CourtGeometry] = None
+        self._matrix = None
+        self._transformer = CoordinateTransformer(None, None)
+        self._camera_position = "unknown"
+        self._cm_per_px_scale: Optional[float] = None
+
+        loader = CourtTransformer(
+            config.court_json_path,
+            court_length_m=self._court_length_m,
+            court_width_m=self._court_width_m,
+        )
+        result = loader.load()
+        self._geometry = result.geometry
+        self._matrix = result.matrix
+        self._transformer = CoordinateTransformer(self._geometry, self._matrix)
+        if self._geometry:
+            self._camera_position = self._classify_camera_position()
+            self._cm_per_px_scale = self._calculate_cm_per_px_scale()
+
+    @property
+    def enabled(self) -> bool:
+        return self._geometry is not None
+
+    @property
+    def geometry(self) -> Optional[CourtGeometry]:
+        return self._geometry
+
+    @property
+    def camera_position(self) -> str:
+        return self._camera_position
+
+    @property
+    def court_length_m(self) -> float:
+        return self._court_length_m
+
+    @property
+    def court_width_m(self) -> float:
+        return self._court_width_m
+
+    @property
+    def cm_per_px_scale(self) -> Optional[float]:
+        return self._cm_per_px_scale
+
+    @property
+    def coordinate_transformer(self) -> CoordinateTransformer:
+        return self._transformer
+
+    def maybe_rescale(self, frame_df: pd.DataFrame, target_w: Optional[int], target_h: Optional[int]) -> None:
+        if not self._geometry:
+            return
+
+        new_w = target_w
+        new_h = target_h
+        if new_w is None or new_h is None:
+            max_x = frame_df["X"].max(skipna=True)
+            max_y = frame_df["Y"].max(skipna=True)
+            if pd.notna(max_x) and pd.notna(max_y):
+                new_w = max(int(max_x) + 1, self._geometry.image_width)
+                new_h = max(int(max_y) + 1, self._geometry.image_height)
+
+        if new_w is None or new_h is None or new_w <= 0 or new_h <= 0:
+            return
+        if new_w == self._geometry.image_width and new_h == self._geometry.image_height:
+            return
+
+        scale_x = new_w / self._geometry.image_width
+        scale_y = new_h / self._geometry.image_height
+        scaled_keypoints = tuple((x * scale_x, y * scale_y) for x, y in self._geometry.keypoints)
+
+        self._geometry = CourtGeometry(
+            length_m=self._geometry.length_m,
+            width_m=self._geometry.width_m,
+            net_height_m=self._geometry.net_height_m,
+            image_width=int(new_w),
+            image_height=int(new_h),
+            keypoints=scaled_keypoints,
+        )
+        transformer = CourtTransformer(
+            None,
+            court_length_m=self._court_length_m,
+            court_width_m=self._court_width_m,
+        )
+        self._matrix = transformer._calculate_transform(scaled_keypoints)
+        self._transformer = CoordinateTransformer(self._geometry, self._matrix)
+        self._camera_position = self._classify_camera_position()
+        self._cm_per_px_scale = self._calculate_cm_per_px_scale()
+
+    def to_court(self, x: float, y: float) -> tuple[float, float]:
+        return self._transformer.to_court(x, y)
+
+    def net_y_at_x(self, x: float) -> float:
+        if not self._geometry or len(self._geometry.keypoints) < 8:
+            return DEFAULT_NET_Y_THRESHOLD
+        net_left = self._geometry.keypoints[6]
+        net_right = self._geometry.keypoints[7]
+        dx = net_right[0] - net_left[0]
+        if abs(dx) < 1e-6:
+            return float(min(net_left[1], net_right[1]))
+        t = (x - net_left[0]) / dx
+        return float(net_left[1] + t * (net_right[1] - net_left[1]))
+
+    def evaluate_backline_start(
+        self,
+        x: float,
+        y: float,
+        scope_px: float,
+        scope_m: float,
+    ) -> dict[str, Any]:
+        if self._camera_position != "backline" or not self._geometry or len(self._geometry.keypoints) < 4:
+            return {
+                "is_strongly_outside_start": False,
+                "start_side_line_distance_px": None,
+                "start_polygon_signed_distance_px": None,
+                "start_court_x_m": None,
+                "start_court_y_m": None,
+                "start_outside_reason": None,
+            }
+
+        p1, p2, p3, p4 = self._geometry.keypoints[:4]
+        near_left = p1
+        far_left = p2
+        far_right = p3
+        near_right = p4
+
+        side_distance_px = min(
+            self._point_to_line_distance(x, y, near_left, far_left),
+            self._point_to_line_distance(x, y, near_right, far_right),
+        )
+        near_corner_distance_px = min(
+            float(np.hypot(x - near_left[0], y - near_left[1])),
+            float(np.hypot(x - near_right[0], y - near_right[1])),
+        )
+        polygon = np.array([near_left, far_left, far_right, near_right], dtype=np.float32)
+        signed_distance = float(cv2.pointPolygonTest(polygon, (float(x), float(y)), True))
+        court_x, court_y = self.to_court(x, y)
+        lateral_limit_m = self._court_length_m / 2.0 + max(scope_m * 1.6, 0.8)
+        width_limit_m = self._court_width_m / 2.0 + max(scope_m * 1.3, 0.6)
+        outside_court = signed_distance < -max(scope_px * 1.2, 24.0)
+        far_from_sideline_extension = side_distance_px > max(scope_px * 3.2, 70.0)
+        far_from_near_corner = near_corner_distance_px > max(scope_px * 2.8, 50.0)
+
+        reason = None
+        if outside_court and far_from_sideline_extension and far_from_near_corner:
+            reason = "outside_court_far_from_sideline_extensions"
+        elif outside_court and abs(court_y) > width_limit_m * 1.6:
+            reason = "too_wide_for_backline_start"
+
+        return {
+            "is_strongly_outside_start": reason is not None,
+            "start_side_line_distance_px": float(side_distance_px),
+            "start_polygon_signed_distance_px": signed_distance,
+            "start_court_x_m": float(court_x),
+            "start_court_y_m": float(court_y),
+            "start_outside_reason": reason,
+        }
+
+    @staticmethod
+    def _point_to_line_distance(
+        x: float,
+        y: float,
+        p1: tuple[float, float],
+        p2: tuple[float, float],
+    ) -> float:
+        x1, y1 = p1
+        x2, y2 = p2
+        dx = x2 - x1
+        dy = y2 - y1
+        denom = math.hypot(dx, dy)
+        if denom <= 1e-6:
+            return float(np.hypot(x - x1, y - y1))
+        return abs(dy * x - dx * y + x2 * y1 - y2 * x1) / denom
+
+    def _classify_camera_position(self) -> str:
+        if not self._geometry or len(self._geometry.keypoints) < 8:
+            return "unknown"
+
+        p1, p2, p3, p4 = self._geometry.keypoints[:4]
+        p7, p8 = self._geometry.keypoints[6], self._geometry.keypoints[7]
+        dx = p8[0] - p7[0]
+        dy = p8[1] - p7[1]
+        court_span = max(
+            np.hypot(p4[0] - p1[0], p4[1] - p1[1]),
+            np.hypot(p3[0] - p2[0], p3[1] - p2[1]),
+            1.0,
+        )
+        net_span = np.hypot(dx, dy)
+        net_span_ratio = net_span / court_span
+
+        if abs(dx) < 1.0 or abs(dy) / (abs(dx) + 1e-6) > 0.7 or net_span_ratio < 0.28:
+            return "sideline"
+
+        left_depth = np.hypot(p2[0] - p1[0], p2[1] - p1[1])
+        right_depth = np.hypot(p4[0] - p3[0], p4[1] - p3[1])
+        depth_ratio = max(left_depth, right_depth) / max(1.0, min(left_depth, right_depth))
+        net_mid_x = (p7[0] + p8[0]) / 2.0
+        center_offset = abs(net_mid_x - self._geometry.image_width / 2.0) / max(
+            1.0, self._geometry.image_width
+        )
+        if depth_ratio <= 1.35 and center_offset <= 0.12:
+            return "backline"
+        return "diagonal"
+
+    def _calculate_cm_per_px_scale(self) -> Optional[float]:
+        if not self._geometry or len(self._geometry.keypoints) < 8:
+            return None
+
+        keypoints = self._geometry.keypoints
+        candidates: list[float] = []
+
+        p1, p3, p4 = keypoints[0], keypoints[2], keypoints[3]
+        span_px = 0.0
+        span_cm = 0.0
+        if self._camera_position == "backline":
+            span_px = float(np.hypot(p1[0] - p4[0], p1[1] - p4[1]))
+            span_cm = self._court_width_m * 100.0
+        elif self._camera_position == "sideline":
+            span_px = float(np.hypot(p3[0] - p4[0], p3[1] - p4[1]))
+            span_cm = self._court_length_m * 100.0
+        if span_px > 1e-6 and span_cm > 0.0:
+            candidates.append(span_cm / span_px)
+
+        p5, p6, p7, p8 = keypoints[4], keypoints[5], keypoints[6], keypoints[7]
+        net_right_px = float(np.hypot(p8[0] - p6[0], p8[1] - p6[1]))
+        net_left_px = float(np.hypot(p7[0] - p5[0], p7[1] - p5[1]))
+        valid_net = [v for v in (net_right_px, net_left_px) if v > 1e-6]
+        if valid_net:
+            candidates.append(NET_HEIGHT_CM / float(np.mean(valid_net)))
+
+        if not candidates:
+            return None
+        return float(np.mean(candidates))
+
+
+class TrackFeatureExtractor:
+    """Computes size-aware, court-aware features for a single track."""
+
+    def __init__(
+        self,
+        court: CourtContext,
+        fps: float,
+        calibration: CsvSizeCalibration,
+        contact_detector: Optional[ContactDetector] = None,
+    ) -> None:
+        self._court = court
+        self._fps = fps
+        self._calibration = calibration
+        self._contact_detector = contact_detector
+
+    @property
+    def player_evidence_enabled(self) -> bool:
+        return self._contact_detector is not None and self._contact_detector.enabled
+
+    def analyze_player_interaction(
+        self,
+        observations: Sequence[FrameObservation],
+    ) -> dict[str, Any]:
+        """Ball-player contacts and trajectory origin for one track."""
+        if not self.player_evidence_enabled or not observations:
+            return {
+                "enabled": False,
+                "contacts": [],
+                "ball_start": None,
+                "ball_end": None,
+                "rally_state": {},
+                "player_proximity": {},
+                "summary": dict(EMPTY_CONTACT_SUMMARY),
+            }
+
+        samples = [
+            BallSample(
+                frame=obs.frame,
+                x=obs.x,
+                y=obs.y,
+                radius_px=obs.smoothed_radius_px or obs.radius_px,
+                confidence=obs.visibility,
+            )
+            for obs in observations
+        ]
+        analysis = self._contact_detector.analyze(samples)
+        return {
+            "enabled": True,
+            "contacts": [contact.to_dict() for contact in analysis.contacts],
+            "ball_start": analysis.start.to_dict() if analysis.start is not None else None,
+            "ball_end": analysis.end.to_dict() if analysis.end is not None else None,
+            "rally_state": analysis.rally_state,
+            "player_proximity": analysis.player_proximity,
+            "summary": summarize_contacts(
+                analysis.contacts,
+                self._fps,
+                analysis.start,
+                analysis.end,
+                analysis.rally_start_frame,
+            ),
+        }
+
+    def build_frame_observations(
+        self,
+        track: Track,
+        observations_by_frame: Dict[int, FrameObservation],
+    ) -> list[FrameObservation]:
+        result: list[FrameObservation] = []
+        for pos, frame in sorted(track.positions, key=lambda item: item[1]):
+            source = observations_by_frame.get(int(frame))
+            if source is not None:
+                result.append(source)
+                continue
+            result.append(
+                FrameObservation(
+                    frame=int(frame),
+                    x=float(pos[0]),
+                    y=float(pos[1]),
+                    radius_px=None,
+                    smoothed_radius_px=None,
+                    visibility=1.0,
+                )
+            )
+        return result
+
+    def compute_ball_size_features(self, observations: Sequence[FrameObservation]) -> BallSizeFeatures:
+        radii = [obs.smoothed_radius_px for obs in observations if obs.smoothed_radius_px and obs.smoothed_radius_px > 0]
+        radius_med_px = float(np.median(radii)) if radii else None
+        diameter_med_px = (radius_med_px * 2.0) if radius_med_px is not None else None
+
+        ball_cm_per_px = None
+        if diameter_med_px and diameter_med_px > 1e-6:
+            ball_cm_per_px = BALL_DIAMETER_CM / diameter_med_px
+
+        effective_scope_px = max(
+            MIN_EFFECTIVE_SCOPE_PX,
+            (diameter_med_px * 1.75) if diameter_med_px is not None else 0.0,
+        )
+
+        court_scope_m = None
+        if self._court.cm_per_px_scale is not None:
+            court_scope_m = effective_scope_px * self._court.cm_per_px_scale / 100.0
+        ball_scope_m = None
+        if ball_cm_per_px is not None:
+            ball_scope_m = effective_scope_px * ball_cm_per_px / 100.0
+
+        candidates = [v for v in (court_scope_m, ball_scope_m) if v is not None and v > 0.0]
+        effective_scope_m = max(MIN_EFFECTIVE_SCOPE_M, float(np.mean(candidates)) if candidates else MIN_EFFECTIVE_SCOPE_M)
+        return BallSizeFeatures(
+            radius_med_px=radius_med_px,
+            diameter_med_px=diameter_med_px,
+            ball_cm_per_px=ball_cm_per_px,
+            effective_scope_px=float(effective_scope_px),
+            effective_scope_m=float(effective_scope_m),
+        )
+
+    def is_above_net(self, observation: FrameObservation, size_features: BallSizeFeatures) -> bool:
+        net_y = self._court.net_y_at_x(observation.x)
+        top_y = observation.y - (observation.smoothed_radius_px or size_features.radius_med_px or 0.0)
+        clearance_px = max(6.0, size_features.effective_scope_px * 0.35)
+
+        if self._court.cm_per_px_scale is None:
+            return top_y < (net_y - clearance_px)
+
+        height_delta_cm = (net_y - top_y) * self._court.cm_per_px_scale
+        return height_delta_cm > max(6.0, size_features.effective_scope_m * 100.0 * 0.3)
+
+    def analyze_post_net_phase(
+        self,
+        observations: Sequence[FrameObservation],
+        last_above_idx: Optional[int],
+        size_features: BallSizeFeatures,
+    ) -> dict[str, Any]:
+        if last_above_idx is None or last_above_idx + 1 >= len(observations):
+            return {
+                "post_net_frames": 0,
+                "post_net_duration_sec": 0.0,
+                "post_net_path_len_px": 0.0,
+                "post_net_path_len_m": 0.0,
+                "post_net_x_range_px": 0.0,
+                "post_net_x_range_m": 0.0,
+                "post_net_vy_sign_changes": 0,
+                "post_net_has_second_phase": False,
+            }
+
+        tail = list(observations[last_above_idx + 1 :])
+        frames = np.array([obs.frame for obs in tail], dtype=np.float64)
+        xs = np.array([obs.x for obs in tail], dtype=np.float64)
+        ys = np.array([obs.y for obs in tail], dtype=np.float64)
+
+        if len(tail) < 2:
+            return {
+                "post_net_frames": len(tail),
+                "post_net_duration_sec": 0.0,
+                "post_net_path_len_px": 0.0,
+                "post_net_path_len_m": 0.0,
+                "post_net_x_range_px": 0.0,
+                "post_net_x_range_m": 0.0,
+                "post_net_vy_sign_changes": 0,
+                "post_net_has_second_phase": False,
+            }
+
+        frame_diffs = np.maximum(np.diff(frames), 1.0)
+        dy = np.diff(ys)
+        dx = np.diff(xs)
+        step_dist_px = np.sqrt(dx * dx + dy * dy)
+        vy = dy / frame_diffs
+        signs = np.sign(vy)
+        signs[np.abs(vy) < max(1.0, size_features.effective_scope_px * 0.15)] = 0
+        signs = signs[signs != 0]
+        vy_sign_changes = int(np.sum(signs[1:] * signs[:-1] < 0)) if len(signs) >= 2 else 0
+
+        path_len_px = float(step_dist_px.sum())
+        path_len_m = path_len_px * size_features.effective_scope_m / max(size_features.effective_scope_px, 1e-6)
+        x_range_px = float(xs.max() - xs.min())
+        x_range_m = x_range_px * size_features.effective_scope_m / max(size_features.effective_scope_px, 1e-6)
+        duration_sec = max(0.0, float(frames[-1] - frames[0]) / self._fps) if self._fps > 0 else 0.0
+
+        has_second_phase = (
+            len(tail) >= 8
+            and duration_sec >= 0.8
+            and path_len_m >= size_features.effective_scope_m * 6.0
+            and vy_sign_changes >= 2
+        )
+        return {
+            "post_net_frames": int(len(tail)),
+            "post_net_duration_sec": float(duration_sec),
+            "post_net_path_len_px": path_len_px,
+            "post_net_path_len_m": float(path_len_m),
+            "post_net_x_range_px": x_range_px,
+            "post_net_x_range_m": float(x_range_m),
+            "post_net_vy_sign_changes": int(vy_sign_changes),
+            "post_net_has_second_phase": bool(has_second_phase),
+        }
+
+    def infer_serve_side(self, observations: Sequence[FrameObservation]) -> str:
+        if not observations:
+            return "unknown"
+
+        seed = observations[: min(6, len(observations))]
+        x = float(np.median([obs.x for obs in seed]))
+        y = float(np.median([obs.y for obs in seed]))
+        start_radii = [
+            obs.smoothed_radius_px for obs in seed if obs.smoothed_radius_px is not None and obs.smoothed_radius_px > 0
+        ]
+        start_radius_med = float(np.median(start_radii)) if start_radii else None
+
+        if self._court.camera_position == "backline":
+            size_features = self.compute_ball_size_features(seed)
+            start_validation = self._court.evaluate_backline_start(
+                x,
+                y,
+                size_features.effective_scope_px,
+                size_features.effective_scope_m,
+            )
+            side_distance = start_validation.get("start_side_line_distance_px")
+            image_width = self._court.geometry.image_width if self._court.geometry is not None else 0
+            side_distance_threshold = max(70.0, image_width * 0.04)
+            if side_distance is not None:
+                if side_distance >= side_distance_threshold:
+                    return "near"
+                if side_distance <= side_distance_threshold * 0.82:
+                    return "far"
+
+            threshold = self._calibration.radius_near_far_threshold_px
+            if start_radius_med is not None and threshold is not None:
+                deadband = max(1.5, threshold * 0.08)
+                if start_radius_med >= threshold + deadband * 2.0:
+                    return "near"
+                if start_radius_med <= threshold + deadband:
+                    return "far"
+            return "near" if y > self._court.net_y_at_x(x) else "far"
+
+        if self._court.camera_position == "sideline":
+            court_x, _ = self._court.to_court(x, y)
+            return "left" if court_x < 0 else "right"
+
+        return "unknown"
+
+    def extract_features(
+        self,
+        track: Track,
+        observations: Sequence[FrameObservation],
+        player_interaction: Optional[dict[str, Any]] = None,
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        if not observations:
+            empty_analysis = {
+                "camera_position": self._court.camera_position,
+                "serve_side": "unknown",
+                "last_above_net_frame": None,
+                "stop_rising_above_net_frame": None,
+                "rolling_start_frame": None,
+                "game_pause_frame": None,
+                "stop_rising_above_net_sec": None,
+                "is_technical_return": False,
+                "technical_return_confidence": 0.0,
+                "technical_return_side": "unknown",
+                "post_net_frames": 0,
+                "post_net_duration_sec": 0.0,
+                "post_net_path_len_m": 0.0,
+                "post_net_has_second_phase": False,
+                "ball_diameter_px_med6_summary": None,
+                "effective_scope_px_summary": None,
+                "effective_scope_m_summary": None,
+            }
+            empty_features = {
+                "track_id": int(track.track_id),
+                "frame_start": int(track.start_frame),
+                "frame_end": int(track.last_frame),
+                "duration_sec": 0.0,
+                "points_count": 0,
+                "coverage": 0.0,
+                "measurement_unit": "m" if self._court.cm_per_px_scale is not None else "px",
+            }
+            empty_classification = {
+                "label": "not_rally",
+                "is_rally": False,
+                "not_rally_reason": "empty_track",
+                "rally_confidence": 0.0,
+                "not_rally_confidence": 1.0,
+                "technical_return_confidence": 0.0,
+                "score": -999,
+            }
+            return empty_analysis, empty_features, empty_classification
+
+        interaction = player_interaction or {"enabled": False, "summary": dict(EMPTY_CONTACT_SUMMARY)}
+        contacts = interaction.get("summary", dict(EMPTY_CONTACT_SUMMARY))
+        has_player_evidence = bool(interaction.get("enabled"))
+
+        size_features = self.compute_ball_size_features(observations)
+        serve_side, serve_side_source = self._resolve_serve_side(observations, contacts)
+        above_flags = [self.is_above_net(obs, size_features) for obs in observations]
+        above_indices = [idx for idx, flag in enumerate(above_flags) if flag]
+        last_above_idx = above_indices[-1] if above_indices else None
+        last_above_frame = observations[last_above_idx].frame if last_above_idx is not None else None
+        stop_rising_frame = observations[last_above_idx + 1].frame if last_above_idx is not None and last_above_idx + 1 < len(observations) else None
+
+        post_net = self.analyze_post_net_phase(observations, last_above_idx, size_features)
+        feature_payload = self._base_feature_payload(track, observations, serve_side, size_features, post_net)
+        feature_payload.update(contacts)
+        feature_payload.update(interaction.get("player_proximity") or {})
+        feature_payload["has_player_evidence"] = has_player_evidence
+        feature_payload["serve_side_source"] = serve_side_source
+        technical_return = self._classify_technical_return(
+            feature_payload, size_features, serve_side, contacts, has_player_evidence
+        )
+        rally_classification = self._classify_rally(
+            feature_payload, technical_return, contacts, has_player_evidence
+        )
+
+        confirmed_pause = technical_return["is_technical_return"]
+        game_pause_frame = stop_rising_frame if confirmed_pause else None
+        stop_rising_sec = (
+            float(stop_rising_frame) / self._fps if stop_rising_frame is not None and self._fps > 0 else None
+        )
+        trajectory_analysis = {
+            "camera_position": self._court.camera_position,
+            "serve_side": serve_side,
+            "last_above_net_frame": int(last_above_frame) if last_above_frame is not None else None,
+            "stop_rising_above_net_frame": int(stop_rising_frame) if stop_rising_frame is not None else None,
+            "rolling_start_frame": None,
+            "game_pause_frame": int(game_pause_frame) if game_pause_frame is not None else None,
+            "stop_rising_above_net_sec": stop_rising_sec,
+            "is_technical_return": technical_return["is_technical_return"],
+            "technical_return_confidence": technical_return["technical_return_confidence"],
+            "technical_return_side": serve_side,
+            "post_net_frames": post_net["post_net_frames"],
+            "post_net_duration_sec": post_net["post_net_duration_sec"],
+            "post_net_path_len_m": post_net["post_net_path_len_m"],
+            "post_net_has_second_phase": post_net["post_net_has_second_phase"],
+            "ball_diameter_px_med6_summary": size_features.diameter_med_px,
+            "start_radius_med_px": feature_payload.get("start_radius_med_px"),
+            "start_radius_near_far_threshold_px": feature_payload.get("start_radius_near_far_threshold_px"),
+            "start_is_strongly_outside_backline": feature_payload.get("start_is_strongly_outside_backline", False),
+            "start_outside_reason": feature_payload.get("start_outside_reason"),
+            "start_side_line_distance_px": feature_payload.get("start_side_line_distance_px"),
+            "start_polygon_signed_distance_px": feature_payload.get("start_polygon_signed_distance_px"),
+            "start_court_x_m": feature_payload.get("start_court_x_m"),
+            "start_court_y_m": feature_payload.get("start_court_y_m"),
+            "outside_main_court_corridor_ratio": feature_payload.get(
+                "outside_main_court_corridor_ratio", 0.0
+            ),
+            "player_box_coverage": feature_payload.get("player_box_coverage", 0.0),
+            "near_player_frame_ratio": feature_payload.get(
+                "near_player_frame_ratio", 0.0
+            ),
+            "min_player_reach_ratio": feature_payload.get("min_player_reach_ratio"),
+            "effective_scope_px_summary": size_features.effective_scope_px,
+            "effective_scope_m_summary": size_features.effective_scope_m,
+            "serve_side_source": serve_side_source,
+            "has_player_evidence": has_player_evidence,
+            "contact_count": contacts["contact_count"],
+            "contact_players_count": contacts["contact_players_count"],
+            "side_switch_count": contacts["side_switch_count"],
+            "dig_count": contacts["dig_count"],
+            "overhead_count": contacts["overhead_count"],
+            "attack_count": contacts["attack_count"],
+            "block_count": contacts["block_count"],
+            "serve_count": contacts["serve_count"],
+            "ball_start_origin": contacts["start_origin"],
+            "ball_start_side": contacts["start_side"],
+            "starts_from_serve_zone": contacts["starts_from_serve_zone"],
+            "starts_inside_court": contacts["starts_inside_court"],
+            "rally_start_frame": contacts["rally_start_frame"],
+            "preparation_sec": contacts["preparation_sec"],
+            "ball_end_origin": contacts["end_origin"],
+            "ball_end_side": contacts["end_side"],
+            "ends_in_court": contacts["ends_in_court"],
+        }
+        feature_payload.update(
+            {
+                "has_game_pause": confirmed_pause,
+                "has_rolling": False,
+                "camera_position": self._court.camera_position,
+                "serve_side": serve_side,
+                "technical_return_score": technical_return["score"],
+            }
+        )
+        return trajectory_analysis, feature_payload, rally_classification
+
+    def _resolve_serve_side(
+        self,
+        observations: Sequence[FrameObservation],
+        contacts: dict[str, Any],
+    ) -> tuple[str, str]:
+        """Prefers the serving player's side over the ball-size heuristic."""
+        playable = {"near", "far", "left", "right"}
+        if contacts.get("starts_from_serve_zone") and contacts.get("start_side") in playable:
+            return str(contacts["start_side"]), "player_serve_zone_start"
+        if contacts.get("serve_side") in playable:
+            return str(contacts["serve_side"]), "player_serve_contact"
+        return self.infer_serve_side(observations), "ball_trajectory"
+
+    def _base_feature_payload(
+        self,
+        track: Track,
+        observations: Sequence[FrameObservation],
+        serve_side: str,
+        size_features: BallSizeFeatures,
+        post_net: dict[str, Any],
+    ) -> dict[str, Any]:
+        frames = np.array([obs.frame for obs in observations], dtype=np.float64)
+        xs = np.array([obs.x for obs in observations], dtype=np.float64)
+        ys = np.array([obs.y for obs in observations], dtype=np.float64)
+
+        duration_frames = max(int(frames[-1] - frames[0] + 1), 1)
+        duration_sec = duration_frames / self._fps if self._fps > 0 else 0.0
+        coverage = float(len(observations) / duration_frames)
+
+        if len(observations) == 1:
+            path_len_px = 0.0
+            median_speed_px_s = 0.0
+            p90_speed_px_s = 0.0
+            max_speed_px_s = 0.0
+            vy_sign_changes = 0
+            vx_sign_changes = 0
+            max_gap_frames = 0
+            gap_count_gt5 = 0
+        else:
+            frame_diffs = np.maximum(np.diff(frames), 1.0)
+            dx = np.diff(xs)
+            dy = np.diff(ys)
+            step_dist_px = np.sqrt(dx * dx + dy * dy)
+            dt = np.maximum(frame_diffs / max(self._fps, 1e-6), 1.0 / max(self._fps, 1.0))
+            speed = step_dist_px / dt
+            path_len_px = float(step_dist_px.sum())
+            median_speed_px_s = float(np.median(speed))
+            p90_speed_px_s = float(np.percentile(speed, 90))
+            max_speed_px_s = float(np.max(speed))
+            vx_sign_changes = self._count_sign_changes(dx)
+            vy_sign_changes = self._count_sign_changes(dy)
+            max_gap_frames = int(np.max(frame_diffs))
+            gap_count_gt5 = int(np.sum(frame_diffs > 5))
+
+        scale_m_per_px = self._resolve_metric_scale(size_features)
+        x_range_px = float(xs.max() - xs.min())
+        y_range_px = float(ys.max() - ys.min())
+        path_len_m = path_len_px * scale_m_per_px if scale_m_per_px is not None else None
+        x_range_m = x_range_px * scale_m_per_px if scale_m_per_px is not None else None
+        y_range_m = y_range_px * scale_m_per_px if scale_m_per_px is not None else None
+
+        start_zone = self._point_zone(observations[: min(6, len(observations))], size_features)
+        end_zone = self._point_zone(observations[-min(6, len(observations)) :], size_features)
+        start_x = float(np.median([obs.x for obs in observations[: min(6, len(observations))]]))
+        start_y = float(np.median([obs.y for obs in observations[: min(6, len(observations))]]))
+        start_validation = self._court.evaluate_backline_start(
+            start_x,
+            start_y,
+            size_features.effective_scope_px,
+            size_features.effective_scope_m,
+        )
+        start_radii = [
+            obs.smoothed_radius_px
+            for obs in observations[: min(6, len(observations))]
+            if obs.smoothed_radius_px is not None and obs.smoothed_radius_px > 0
+        ]
+        start_radius_med_px = float(np.median(start_radii)) if start_radii else None
+        corridor_checks = [
+            self._court.evaluate_backline_start(
+                obs.x,
+                obs.y,
+                size_features.effective_scope_px,
+                size_features.effective_scope_m,
+            )
+            for obs in observations
+        ]
+        outside_corridor_ratio = float(
+            np.mean(
+                [
+                    bool(check["is_strongly_outside_start"])
+                    for check in corridor_checks
+                ]
+            )
+        )
+
+        return {
+            "track_id": int(track.track_id),
+            "frame_start": int(frames[0]),
+            "frame_end": int(frames[-1]),
+            "duration_sec": float(duration_sec),
+            "points_count": int(len(observations)),
+            "coverage": coverage,
+            "x_range_px": x_range_px,
+            "y_range_px": y_range_px,
+            "path_len_px": path_len_px,
+            "median_speed_px_s": median_speed_px_s,
+            "p90_speed_px_s": p90_speed_px_s,
+            "max_speed_px_s": max_speed_px_s,
+            "vy_sign_changes": int(vy_sign_changes),
+            "vx_sign_changes": int(vx_sign_changes),
+            "gap_count_gt5": int(gap_count_gt5),
+            "max_gap_frames": int(max_gap_frames),
+            "measurement_unit": "m" if scale_m_per_px is not None else "px",
+            "x_range_m": float(x_range_m) if x_range_m is not None else None,
+            "y_range_m": float(y_range_m) if y_range_m is not None else None,
+            "path_len_m": float(path_len_m) if path_len_m is not None else None,
+            "post_net_path_len_m": float(post_net["post_net_path_len_m"]),
+            "post_net_duration_sec": float(post_net["post_net_duration_sec"]),
+            "post_net_has_second_phase": bool(post_net["post_net_has_second_phase"]),
+            "start_zone": start_zone,
+            "end_zone": end_zone,
+            "serve_side": serve_side,
+            "start_radius_med_px": start_radius_med_px,
+            "start_radius_near_far_threshold_px": self._calibration.radius_near_far_threshold_px,
+            "start_is_strongly_outside_backline": start_validation["is_strongly_outside_start"],
+            "start_outside_reason": start_validation["start_outside_reason"],
+            "start_side_line_distance_px": start_validation["start_side_line_distance_px"],
+            "start_polygon_signed_distance_px": start_validation["start_polygon_signed_distance_px"],
+            "start_court_x_m": start_validation["start_court_x_m"],
+            "start_court_y_m": start_validation["start_court_y_m"],
+            "outside_main_court_corridor_ratio": outside_corridor_ratio,
+            "crosses_net": bool(post_net["post_net_frames"] > 0),
+            "ball_diameter_px_med6": size_features.diameter_med_px,
+            "effective_scope_px": size_features.effective_scope_px,
+            "effective_scope_m": size_features.effective_scope_m,
+        }
+
+    @staticmethod
+    def _count_sign_changes(values: np.ndarray, eps: float = 2.0) -> int:
+        if values.size < 2:
+            return 0
+        signs = np.sign(values)
+        signs[np.abs(values) < eps] = 0
+        signs = signs[signs != 0]
+        if signs.size < 2:
+            return 0
+        return int(np.sum(signs[1:] * signs[:-1] < 0))
+
+    def _resolve_metric_scale(self, size_features: BallSizeFeatures) -> Optional[float]:
+        candidates = []
+        if self._court.cm_per_px_scale is not None:
+            candidates.append(self._court.cm_per_px_scale / 100.0)
+        if size_features.ball_cm_per_px is not None:
+            candidates.append(size_features.ball_cm_per_px / 100.0)
+        if not candidates:
+            return None
+        return float(np.mean(candidates))
+
+    def _point_zone(self, observations: Sequence[FrameObservation], size_features: BallSizeFeatures) -> str:
+        if not observations:
+            return "unknown"
+        x = float(np.median([obs.x for obs in observations]))
+        y = float(np.median([obs.y for obs in observations]))
+        if self._court.camera_position == "backline":
+            return "near" if y > self._court.net_y_at_x(x) else "far"
+        if self._court.camera_position == "sideline":
+            court_x, _ = self._court.to_court(x, y)
+            threshold = size_features.effective_scope_m
+            if court_x < -threshold:
+                return "left"
+            if court_x > threshold:
+                return "right"
+            return "center"
+        return "unknown"
+
+    def _classify_technical_return(
+        self,
+        features: dict[str, Any],
+        size_features: BallSizeFeatures,
+        serve_side: str,
+        contacts: dict[str, Any],
+        has_player_evidence: bool,
+    ) -> dict[str, Any]:
+        scope_m = max(size_features.effective_scope_m, 1e-6)
+        score = 0
+        reasons: list[str] = []
+
+        duration_sec = features["duration_sec"]
+        path_len_m = features.get("path_len_m")
+        x_range_m = features.get("x_range_m")
+        post_net_path_len_m = features.get("post_net_path_len_m", 0.0)
+
+        foreign_court_trajectory = is_foreign_court_trajectory(features)
+        if foreign_court_trajectory:
+            score += 8
+            reasons.append("foreign_court_trajectory")
+
+        if duration_sec <= 2.6:
+            score += 3
+            reasons.append("short_duration")
+        if path_len_m is not None and path_len_m <= scope_m * 12.0:
+            score += 3
+            reasons.append("short_path")
+        if x_range_m is not None and x_range_m <= scope_m * 3.5:
+            score += 2
+            reasons.append("tight_lateral_range")
+        if features["vy_sign_changes"] <= 5:
+            score += 1
+            reasons.append("simple_vertical_shape")
+        if not features["post_net_has_second_phase"]:
+            score += 2
+            reasons.append("no_second_phase")
+        if post_net_path_len_m <= scope_m * 6.0:
+            score += 1
+            reasons.append("short_post_net_tail")
+        if serve_side in {"near", "far", "left", "right"} and features["end_zone"] == serve_side:
+            score += 1
+            reasons.append("returns_to_serve_side")
+        if (
+            features.get("crosses_net")
+            and not foreign_court_trajectory
+            and path_len_m is not None
+            and path_len_m >= scope_m * 13.0
+            and duration_sec >= 1.8
+        ):
+            score -= 5
+            reasons.append("crosses_net_with_game_length")
+
+        score += self._technical_return_player_score(contacts, has_player_evidence, reasons)
+
+        confidence = 1.0 / (1.0 + math.exp(-(float(score) - 5.5)))
+        return {
+            "is_technical_return": confidence >= 0.5,
+            "technical_return_confidence": float(confidence),
+            "score": int(score),
+            "reasons": reasons,
+        }
+
+    @staticmethod
+    def _technical_return_player_score(
+        contacts: dict[str, Any],
+        has_player_evidence: bool,
+        reasons: list[str],
+    ) -> int:
+        """Player evidence for 'ball handed over to the opponent for a serve'."""
+        if not has_player_evidence:
+            return 0
+
+        score = 0
+        contact_count = int(contacts["contact_count"])
+        switches = int(contacts["side_switch_count"])
+
+        # Positive evidence needs a known origin: a track that starts mid-flight
+        # is a fragment of some episode, and short fragments of real rallies
+        # look exactly like a handover otherwise.
+        if contacts["starts_inside_court"]:
+            score += 3
+            reasons.append("ball_starts_from_player_inside_court")
+            if contact_count <= 2:
+                score += 2
+                reasons.append("almost_no_player_contacts")
+            if switches == 0:
+                score += 1
+                reasons.append("no_side_exchange")
+        if contacts["ends_in_court"] and contact_count <= 2 and switches == 0:
+            # A rally ends with the ball on the sand or out; a handover ends in
+            # somebody's hands in the middle of the court.
+            score += 3
+            reasons.append("ball_caught_by_player_inside_court")
+        if contacts["starts_from_serve_zone"]:
+            score -= 4
+            reasons.append("ball_starts_from_serve_zone")
+        if contacts["has_serve_contact"]:
+            score -= 2
+            reasons.append("serve_contact_detected")
+        if contact_count >= 5:
+            score -= 3
+            reasons.append("many_player_contacts")
+        if switches >= 2:
+            score -= 3
+            reasons.append("ball_exchanged_between_sides")
+        if int(contacts["contact_players_count"]) >= 3:
+            score -= 2
+            reasons.append("multiple_players_involved")
+        return score
+
+    def _classify_rally(
+        self,
+        features: dict[str, Any],
+        technical_return: dict[str, Any],
+        contacts: dict[str, Any],
+        has_player_evidence: bool,
+    ) -> dict[str, Any]:
+        if technical_return["is_technical_return"]:
+            return {
+                "label": "not_rally",
+                "is_rally": False,
+                "not_rally_reason": "technical_return",
+                "rally_confidence": float(1.0 - technical_return["technical_return_confidence"]),
+                "not_rally_confidence": float(technical_return["technical_return_confidence"]),
+                "technical_return_confidence": technical_return["technical_return_confidence"],
+                "score": int(-technical_return["score"]),
+                "positive_flags": [],
+                "penalty_flags": technical_return["reasons"],
+            }
+
+        score = 0
+        positive_flags: list[str] = []
+        penalty_flags: list[str] = []
+        scope_m = max(features.get("effective_scope_m", MIN_EFFECTIVE_SCOPE_M), 1e-6)
+
+        if features["duration_sec"] >= 4.0:
+            score += 2
+            positive_flags.append("long_duration")
+        if features.get("path_len_m") is not None and features["path_len_m"] >= scope_m * 18.0:
+            score += 3
+            positive_flags.append("long_path")
+        if features.get("x_range_m") is not None and features["x_range_m"] >= scope_m * 4.5:
+            score += 1
+            positive_flags.append("wide_x_range")
+        if features.get("y_range_m") is not None and features["y_range_m"] >= scope_m * 5.0:
+            score += 1
+            positive_flags.append("wide_y_range")
+        if features["vy_sign_changes"] >= 7:
+            score += 1
+            positive_flags.append("many_vertical_phases")
+        if features["post_net_has_second_phase"]:
+            score += 2
+            positive_flags.append("post_net_continuation")
+        elif features["post_net_duration_sec"] < 0.6:
+            score -= 1
+            penalty_flags.append("short_post_net_tail")
+        if features.get("start_is_strongly_outside_backline"):
+            score -= 1
+            penalty_flags.append(features.get("start_outside_reason", "outside_backline_start"))
+
+        score += self._rally_player_score(contacts, has_player_evidence, positive_flags, penalty_flags)
+
+        rally_confidence = 1.0 / (1.0 + math.exp(-(float(score) - 4.0)))
+        return {
+            "label": "rally" if rally_confidence >= 0.5 else "not_rally",
+            "is_rally": rally_confidence >= 0.5,
+            "not_rally_reason": (
+                None
+                if rally_confidence >= 0.5
+                else self._not_rally_reason(contacts, has_player_evidence)
+            ),
+            "rally_confidence": float(rally_confidence),
+            "not_rally_confidence": float(1.0 - rally_confidence),
+            "technical_return_confidence": technical_return["technical_return_confidence"],
+            "score": int(score),
+            "positive_flags": positive_flags,
+            "penalty_flags": penalty_flags,
+        }
+
+    @staticmethod
+    def _not_rally_reason(contacts: dict[str, Any], has_player_evidence: bool) -> str:
+        """Names the evidence behind a not_rally verdict."""
+        if not has_player_evidence:
+            return "insufficient_rally_evidence"
+
+        quiet = int(contacts["contact_count"]) <= 2 and int(contacts["side_switch_count"]) == 0
+        if quiet and (contacts["starts_inside_court"] or contacts["ends_in_court"]):
+            return "technical_return"
+        return "insufficient_rally_evidence"
+
+    @staticmethod
+    def _rally_player_score(
+        contacts: dict[str, Any],
+        has_player_evidence: bool,
+        positive_flags: list[str],
+        penalty_flags: list[str],
+    ) -> int:
+        """Player evidence that the episode is real play, not a ball handover."""
+        if not has_player_evidence:
+            return 0
+
+        score = 0
+        contact_count = int(contacts["contact_count"])
+        switches = int(contacts["side_switch_count"])
+
+        if contacts["starts_from_serve_zone"]:
+            score += 2
+            positive_flags.append("starts_from_serve_zone")
+        if contacts["has_serve_contact"]:
+            score += 1
+            positive_flags.append("serve_contact_detected")
+        if switches >= 2:
+            score += 3
+            positive_flags.append("ball_exchanged_between_sides")
+        elif switches == 1:
+            score += 1
+            positive_flags.append("single_side_exchange")
+        if contact_count >= 5:
+            score += 2
+            positive_flags.append("many_player_contacts")
+        elif contact_count >= 3:
+            score += 1
+            positive_flags.append("several_player_contacts")
+        if int(contacts["dig_count"]) + int(contacts["attack_count"]) >= 2:
+            score += 1
+            positive_flags.append("defensive_and_attacking_touches")
+        if contacts["starts_inside_court"] and contact_count <= 2 and switches == 0:
+            score -= 3
+            penalty_flags.append("ball_starts_from_player_inside_court")
+        return score
+
+
+class MatchStateMachine:
+    """Tracks serve order and estimated score across a sequence of tracks."""
+
+    def __init__(self, camera_position: str) -> None:
+        self._camera_position = camera_position
+        self._score = self._init_score(camera_position)
+        self._state = "awaiting_technical_return"
+        self._expected_server = "unknown"
+        self._service_turn_index = 0
+        self._rally_index = 0
+        self._pending_rally_track_id: Optional[int] = None
+
+    def apply(self, records: Sequence[TrackAnalysisRecord]) -> list[TrackAnalysisRecord]:
+        updated: list[TrackAnalysisRecord] = []
+        for record in sorted(records, key=lambda item: item.track.start_frame):
+            record.state_before = self._snapshot()
+            self._apply_contextual_adjustments(record)
+            score_event = self._transition(record)
+            record.score_event = score_event
+            record.state_after = self._snapshot()
+            updated.append(record)
+        return updated
+
+    def _apply_contextual_adjustments(self, record: TrackAnalysisRecord) -> None:
+        serve_side = record.trajectory_analysis.get("serve_side", "unknown")
+        duration_sec = record.rally_features.get("duration_sec", 0.0)
+        path_len_m = record.rally_features.get("path_len_m")
+        technical_conf = float(record.rally_classification.get("technical_return_confidence", 0.0))
+        rally_conf = float(record.rally_classification.get("rally_confidence", 0.0))
+        foreign_court_trajectory = is_foreign_court_trajectory(record.rally_features)
+
+        if (
+            record.rally_classification.get("label") == "not_rally"
+            and record.rally_classification.get("not_rally_reason") != "technical_return"
+            and not foreign_court_trajectory
+            and self._expected_server != "unknown"
+            and serve_side == self._expected_server
+            and duration_sec >= 3.0
+            and path_len_m is not None
+            and path_len_m >= record.rally_features.get("effective_scope_m", MIN_EFFECTIVE_SCOPE_M) * 14.0
+        ):
+            boosted_conf = max(rally_conf, 0.72)
+            record.rally_classification.update(
+                {
+                    "label": "rally",
+                    "is_rally": True,
+                    "not_rally_reason": None,
+                    "rally_confidence": boosted_conf,
+                    "not_rally_confidence": 1.0 - boosted_conf,
+                    "state_machine_adjustment": "serve_queue_promoted_to_rally",
+                }
+            )
+            positives = list(record.rally_classification.get("positive_flags", []))
+            positives.append("state_machine_expected_server_match")
+            record.rally_classification["positive_flags"] = positives
+
+        if (
+            record.rally_classification.get("not_rally_reason") == "technical_return"
+            and self._expected_server != "unknown"
+            and serve_side == self._expected_server
+        ):
+            boosted_conf = min(0.99, max(technical_conf, 0.75) + 0.1)
+            record.rally_classification["technical_return_confidence"] = boosted_conf
+            record.rally_classification["not_rally_confidence"] = boosted_conf
+            record.rally_classification["rally_confidence"] = 1.0 - boosted_conf
+            penalties = list(record.rally_classification.get("penalty_flags", []))
+            penalties.append("state_machine_expected_server_match")
+            record.rally_classification["penalty_flags"] = penalties
+            record.trajectory_analysis["technical_return_confidence"] = boosted_conf
+
+    def _transition(self, record: TrackAnalysisRecord) -> Optional[dict[str, Any]]:
+        label = record.rally_classification.get("label")
+        reason = record.rally_classification.get("not_rally_reason")
+        serve_side = record.trajectory_analysis.get("serve_side", "unknown")
+        score_event = None
+
+        if label == "rally":
+            self._state = "rally_in_progress"
+            self._pending_rally_track_id = int(record.track.track_id)
+            self._rally_index += 1
+            record.rally_features["serve_queue_position"] = self._service_turn_index
+            record.rally_features["expected_server_side"] = self._expected_server
+            return None
+
+        if reason == "technical_return":
+            if self._pending_rally_track_id is not None and serve_side in self._score:
+                self._score[serve_side] += 1
+                score_event = {
+                    "winner_side": serve_side,
+                    "score_after": dict(self._score),
+                    "resolved_rally_track_id": self._pending_rally_track_id,
+                }
+            self._pending_rally_track_id = None
+            if serve_side in self._score:
+                self._expected_server = serve_side
+            self._service_turn_index += 1
+            self._state = "ready_for_serve"
+            record.rally_features["serve_queue_position"] = self._service_turn_index
+            record.rally_features["expected_server_side"] = self._expected_server
+            return score_event
+
+        record.rally_features["serve_queue_position"] = self._service_turn_index
+        record.rally_features["expected_server_side"] = self._expected_server
+        return None
+
+    def _snapshot(self) -> dict[str, Any]:
+        return {
+            "state": self._state,
+            "expected_server_side": self._expected_server,
+            "score": dict(self._score),
+            "service_turn_index": self._service_turn_index,
+            "rally_index": self._rally_index,
+            "pending_rally_track_id": self._pending_rally_track_id,
+        }
+
+    @staticmethod
+    def _init_score(camera_position: str) -> dict[str, int]:
+        if camera_position == "sideline":
+            return {"left": 0, "right": 0}
+        return {"near": 0, "far": 0}
+
+
+class TrackCalculatorWithCourt:
+    """Structured pipeline for track generation and court-aware analysis."""
+
+    def __init__(self, config: TrackCalculatorConfig) -> None:
+        self.config = config
+        self.tracks: list[Track] = []
+        self._court = CourtContext(config)
+        self._csv_size_calibration = CsvSizeCalibration(
+            radius_lower_px=None,
+            radius_upper_px=None,
+            radius_median_px=None,
+            radius_near_far_threshold_px=None,
+            filtered_count=0,
+        )
+        self._frame_width_scale = self._compute_frame_width_scale()
+        self._scaled_max_distance = self.config.max_distance * self._frame_width_scale
+        self._ball_frame_step = 1
+        self._player_store = PlayerStore(None)
+        self._contact_detector: Optional[ContactDetector] = None
+        self._feature_extractor = TrackFeatureExtractor(
+            self._court,
+            self.config.fps,
+            self._csv_size_calibration,
+        )
+        self._observations_by_frame: dict[int, FrameObservation] = {}
+
+    def run(self) -> None:
+        df = self._load_csv()
+        self._process_detections(df)
+        records = self._save_tracks_to_json()
+        self._log_summary(records)
+
+    def _log_summary(self, records: Sequence[TrackAnalysisRecord]) -> None:
+        rallies = sum(1 for record in records if record.rally_classification.get("is_rally"))
+        LOG.info(
+            "Done. Found %s tracks: %s rally, %s not_rally.",
+            len(records),
+            rallies,
+            len(records) - rallies,
+        )
+        if not self._player_store.enabled:
+            return
+
+        for record in records:
+            summary = record.player_interaction.get("summary", {})
+            LOG.debug(
+                "track %04d %-9s serve=%-7s origin=%-11s contacts=%d "
+                "(serve %d / dig %d / overhead %d / attack %d / block %d) switches=%d",
+                record.track.track_id,
+                record.rally_classification.get("label"),
+                record.trajectory_analysis.get("serve_side"),
+                summary.get("start_origin"),
+                summary.get("contact_count", 0),
+                summary.get("serve_count", 0),
+                summary.get("dig_count", 0),
+                summary.get("overhead_count", 0),
+                summary.get("attack_count", 0),
+                summary.get("block_count", 0),
+                summary.get("side_switch_count", 0),
+            )
+        totals = {
+            key: sum(int(record.player_interaction["summary"].get(key, 0)) for record in records)
+            for key in ("contact_count", "serve_count", "dig_count", "overhead_count", "attack_count", "block_count")
+        }
+        from_serve_zone = sum(
+            1 for record in records if record.player_interaction["summary"].get("starts_from_serve_zone")
+        )
+        from_court = sum(
+            1 for record in records if record.player_interaction["summary"].get("starts_inside_court")
+        )
+        LOG.info(
+            "Player contacts: %d total (serve %d, dig %d, overhead %d, attack %d, block %d); "
+            "tracks starting from serve zone: %d, from a player inside the court: %d",
+            totals["contact_count"],
+            totals["serve_count"],
+            totals["dig_count"],
+            totals["overhead_count"],
+            totals["attack_count"],
+            totals["block_count"],
+            from_serve_zone,
+            from_court,
+        )
+
+    def _compute_frame_width_scale(self) -> float:
+        width = self._resolved_video_width()
+        if width is None or width <= 0:
+            return 1.0
+        return width / REFERENCE_VIDEO_WIDTH
+
+    def _resolved_video_width(self) -> Optional[int]:
+        if self.config.video_width is not None and self.config.video_width > 0:
+            return self.config.video_width
+        if self._court.geometry is not None:
+            return self._court.geometry.image_width
+        return None
+
+    def _resolved_video_height(self) -> Optional[int]:
+        if self.config.video_height is not None and self.config.video_height > 0:
+            return self.config.video_height
+        if self._court.geometry is not None:
+            return self._court.geometry.image_height
+        return None
+
+    def _load_csv(self) -> pd.DataFrame:
+        df = self._read_ball_csv() if self.config.csv_path else self._empty_ball_frame()
+        self._apply_radius_smoothing(df)
+
+        self._court.maybe_rescale(df, self.config.video_width, self.config.video_height)
+        self._build_player_context()
+        if not self.config.csv_path:
+            # No CSV: the players model is the only ball detector we have.
+            df = self._ball_frame_from_players()
+            self._apply_radius_smoothing(df)
+        elif self._apply_player_ball_detections(df):
+            self._apply_radius_smoothing(df)
+        self._ball_frame_step = self._detection_frame_step(df)
+        if self._ball_frame_step > 1:
+            LOG.info(
+                "Ball detected every %d frames: tracking windows scaled accordingly",
+                self._ball_frame_step,
+            )
+        self._build_contact_detector()
+        self._feature_extractor = TrackFeatureExtractor(
+            self._court,
+            self.config.fps,
+            self._csv_size_calibration,
+            self._contact_detector,
+        )
+        self._observations_by_frame = self._build_observation_index(df)
+        return df
+
+    def _read_ball_csv(self) -> pd.DataFrame:
+        if not os.path.exists(self.config.csv_path):
+            raise FileNotFoundError(f"CSV not found: {self.config.csv_path}")
+
+        df = pd.read_csv(self.config.csv_path)
+        for column in ("Frame", "Visibility", "X", "Y", "Radius"):
+            if column not in df.columns:
+                df[column] = np.nan
+            df[column] = pd.to_numeric(df[column], errors="coerce")
+
+        df.loc[(df["Visibility"] <= 0) | (df["X"] == -1), ["X", "Y"]] = np.nan
+        df["BallSource"] = np.where(df["X"].notna(), "csv", "none")
+        return df
+
+    @staticmethod
+    def _empty_ball_frame() -> pd.DataFrame:
+        df = pd.DataFrame(columns=["Frame", "Visibility", "X", "Y", "Radius"], dtype=float)
+        df["BallSource"] = pd.Series(dtype=object)
+        return df
+
+    def _ball_frame_from_players(self) -> pd.DataFrame:
+        """Ball detections of the players model in the shape of the ball CSV.
+
+        Frames without a detection are kept as empty rows: the tracker needs to
+        see the blind frames to close a track instead of bridging the pause.
+        """
+        samples = self._player_store.ball_samples()
+        if not samples:
+            raise ValueError(
+                "No --csv_path given and no ball detections in "
+                f"{self.config.players_json_path}"
+            )
+
+        span = self._player_store.frame_range() or (samples[0].frame, samples[-1].frame)
+        first = min(span[0], samples[0].frame)
+        last = max(span[1], samples[-1].frame)
+        by_frame = {sample.frame: sample for sample in samples}
+
+        rows = []
+        for frame in range(int(first), int(last) + 1):
+            sample = by_frame.get(frame)
+            if sample is None:
+                rows.append((float(frame), 0.0, np.nan, np.nan, np.nan, "none"))
+                continue
+            rows.append(
+                (
+                    float(frame),
+                    float(sample.confidence),
+                    float(sample.x),
+                    float(sample.y),
+                    float(sample.radius_px) if sample.radius_px else np.nan,
+                    "players",
+                )
+            )
+
+        LOG.info(
+            "Ball taken from the players JSON: %d detections over frames %d-%d",
+            len(samples),
+            int(first),
+            int(last),
+        )
+        return pd.DataFrame(rows, columns=["Frame", "Visibility", "X", "Y", "Radius", "BallSource"])
+
+    def _build_player_context(self) -> None:
+        """Loads player and ball detections and the contact detector on top."""
+        self._player_store = PlayerStore(
+            self.config.players_json_path,
+            court=self._court if self._court.enabled else None,
+            score_threshold=self.config.player_score_threshold,
+            ball_score_threshold=self.config.ball_score_threshold,
+            source_width=self._resolved_video_width(),
+            source_height=self._resolved_video_height(),
+        )
+        self._build_contact_detector()
+
+    def _build_contact_detector(self) -> None:
+        self._contact_detector = (
+            ContactDetector(
+                self._player_store,
+                self._court,
+                self.config.fps,
+                frame_step=self._ball_frame_step,
+            )
+            if self._player_store.enabled and self._court.enabled
+            else None
+        )
+
+    def _apply_radius_smoothing(self, df: pd.DataFrame) -> None:
+        valid_radius = df["Radius"].where(df["Radius"] > 0)
+        self._csv_size_calibration = self._build_csv_size_calibration(valid_radius)
+        window = BALL_SIZE_WINDOW * self._detection_frame_step(df)
+        df["RadiusMed6"] = (
+            valid_radius.rolling(window=window, min_periods=1, center=True).median()
+        )
+        global_radius = (
+            self._csv_size_calibration.radius_median_px
+            if self._csv_size_calibration.radius_median_px is not None
+            else float(valid_radius.median()) if valid_radius.notna().any() else np.nan
+        )
+        df["RadiusMed6"] = df["RadiusMed6"].fillna(global_radius)
+
+    @staticmethod
+    def _detection_frame_step(df: pd.DataFrame) -> int:
+        """Sampling step of the ball detections: 2 for a model run every other frame."""
+        frames = df.loc[df["X"].notna(), "Frame"].dropna().to_numpy(dtype=float)
+        if len(frames) < 2:
+            return 1
+        steps = np.diff(np.unique(frames))
+        step = int(np.median(steps)) if len(steps) else 1
+        return step if 1 <= step <= MAX_BALL_FRAME_STEP else 1
+
+    def _apply_player_ball_detections(self, df: pd.DataFrame) -> bool:
+        """Fills gaps and repairs outliers in the CSV with the players-model ball.
+
+        The two detectors miss different frames, and a dropout right at a touch
+        is what splits one rally into several tracks.
+        """
+        if not self.config.use_player_ball or not self._player_store.has_ball_detections:
+            return False
+
+        frames = df["Frame"].to_numpy(dtype=float)
+        xs = df["X"].to_numpy(dtype=float, copy=True)
+        ys = df["Y"].to_numpy(dtype=float, copy=True)
+        original_xs = xs.copy()
+        original_ys = ys.copy()
+        radii = df["Radius"].to_numpy(dtype=float, copy=True)
+        visibility = df["Visibility"].to_numpy(dtype=float, copy=True)
+        source = df["BallSource"].to_numpy(dtype=object, copy=True)
+
+        filled = 0
+        repaired = 0
+        rejected = 0
+        for index, frame in enumerate(frames):
+            if not np.isfinite(frame):
+                continue
+            ball = self._player_store.ball_at(int(frame))
+            if ball is None:
+                continue
+
+            if np.isnan(original_xs[index]):
+                expected = self._interpolate_neighbors(
+                    frames, original_xs, original_ys, index, BALL_FILL_NEIGHBOR_FRAMES
+                )
+                if expected is None:
+                    continue
+                if not self._fill_matches_flight(
+                    frames, original_xs, original_ys, index, ball.x, ball.y, expected
+                ):
+                    rejected += 1
+                    continue
+                xs[index] = ball.x
+                ys[index] = ball.y
+                radii[index] = ball.radius_px or radii[index]
+                visibility[index] = max(
+                    float(visibility[index]) if np.isfinite(visibility[index]) else 0.0,
+                    ball.confidence,
+                )
+                source[index] = "players_fill"
+                filled += 1
+                continue
+
+            expected = self._interpolate_neighbors(
+                frames, original_xs, original_ys, index, BALL_REPAIR_NEIGHBOR_FRAMES
+            )
+            if expected is None:
+                continue
+            csv_error = float(np.hypot(original_xs[index] - expected[0], original_ys[index] - expected[1]))
+            ball_error = float(np.hypot(ball.x - expected[0], ball.y - expected[1]))
+            if csv_error > BALL_REPAIR_MIN_ERROR_PX and csv_error > ball_error * BALL_REPAIR_ERROR_RATIO:
+                xs[index] = ball.x
+                ys[index] = ball.y
+                radii[index] = ball.radius_px or radii[index]
+                visibility[index] = max(
+                    float(visibility[index]) if np.isfinite(visibility[index]) else 0.0,
+                    ball.confidence,
+                )
+                source[index] = "players_repair"
+                repaired += 1
+
+        df["X"] = xs
+        df["Y"] = ys
+        df["Radius"] = radii
+        df["Visibility"] = visibility
+        df["BallSource"] = source
+        LOG.info(
+            "Ball detections from players JSON: %d frames filled, %d outliers repaired, "
+            "%d off-flight fills rejected",
+            filled,
+            repaired,
+            rejected,
+        )
+        return bool(filled or repaired)
+
+    def _fill_matches_flight(
+        self,
+        frames: np.ndarray,
+        xs: np.ndarray,
+        ys: np.ndarray,
+        index: int,
+        ball_x: float,
+        ball_y: float,
+        expected: tuple[float, float],
+    ) -> bool:
+        """Whether a players-model ball fits the flight between its CSV neighbors."""
+        window = BALL_FILL_NEIGHBOR_FRAMES
+        previous = next(i for i in range(index - 1, max(-1, index - window - 1), -1) if not np.isnan(xs[i]))
+        following = next(i for i in range(index + 1, min(len(xs), index + window + 1)) if not np.isnan(xs[i]))
+        chord = float(np.hypot(xs[following] - xs[previous], ys[following] - ys[previous]))
+        tolerance = max(
+            BALL_FILL_MIN_TOLERANCE_PX * self._frame_width_scale,
+            BALL_FILL_TOLERANCE_CHORD_RATIO * chord,
+        )
+        error = float(np.hypot(ball_x - expected[0], ball_y - expected[1]))
+        if error <= tolerance:
+            return True
+        LOG.debug(
+            "Frame %d: players ball (%.0f, %.0f) is %.0f px off the flight (tolerance %.0f), not filled",
+            int(frames[index]),
+            ball_x,
+            ball_y,
+            error,
+            tolerance,
+        )
+        return False
+
+    @staticmethod
+    def _interpolate_neighbors(
+        frames: np.ndarray,
+        xs: np.ndarray,
+        ys: np.ndarray,
+        index: int,
+        window: int,
+    ) -> Optional[tuple[float, float]]:
+        """Ball position at `index` predicted from the closest detections around it."""
+        previous = next(
+            (i for i in range(index - 1, max(-1, index - window - 1), -1) if not np.isnan(xs[i])),
+            None,
+        )
+        following = next(
+            (i for i in range(index + 1, min(len(xs), index + window + 1)) if not np.isnan(xs[i])),
+            None,
+        )
+        if previous is None or following is None:
+            return None
+
+        span = frames[following] - frames[previous]
+        if span <= 0:
+            return None
+        weight = (frames[index] - frames[previous]) / span
+        return (
+            float(xs[previous] + (xs[following] - xs[previous]) * weight),
+            float(ys[previous] + (ys[following] - ys[previous]) * weight),
+        )
+
+    @staticmethod
+    def _build_csv_size_calibration(valid_radius: pd.Series) -> CsvSizeCalibration:
+        radii = [float(v) for v in valid_radius.dropna().tolist() if float(v) > 0]
+        if not radii:
+            return CsvSizeCalibration(None, None, None, None, 0)
+
+        q1 = float(np.percentile(radii, 25))
+        q3 = float(np.percentile(radii, 75))
+        iqr = q3 - q1
+        lower = max(0.0, q1 - 1.5 * iqr)
+        upper = q3 + 1.5 * iqr
+        filtered = [value for value in radii if lower <= value <= upper]
+        if not filtered:
+            filtered = radii
+
+        median = float(np.median(filtered))
+        return CsvSizeCalibration(
+            radius_lower_px=float(lower),
+            radius_upper_px=float(upper),
+            radius_median_px=median,
+            radius_near_far_threshold_px=median,
+            filtered_count=len(filtered),
+        )
+
+    @staticmethod
+    def _build_observation_index(df: pd.DataFrame) -> dict[int, FrameObservation]:
+        result: dict[int, FrameObservation] = {}
+        for row in df.itertuples(index=False):
+            if pd.isna(row.Frame):
+                continue
+            frame = int(row.Frame)
+            if pd.isna(row.X) or pd.isna(row.Y):
+                continue
+            radius = float(row.Radius) if pd.notna(row.Radius) and row.Radius > 0 else None
+            smoothed_radius = (
+                float(row.RadiusMed6)
+                if pd.notna(row.RadiusMed6) and row.RadiusMed6 > 0
+                else radius
+            )
+            result[frame] = FrameObservation(
+                frame=frame,
+                x=float(row.X),
+                y=float(row.Y),
+                radius_px=radius,
+                smoothed_radius_px=smoothed_radius,
+                visibility=float(row.Visibility) if pd.notna(row.Visibility) else 1.0,
+            )
+        return result
+
+    def _process_detections(self, df: pd.DataFrame) -> None:
+        tracker = BallTracker(
+            buffer_size=2500,
+            max_disappeared=40,
+            max_distance=self._tracking_max_distance,
+            fps=self.config.fps,
+            frame_step=self._ball_frame_step,
+        )
+        closed_tracks: list[Track] = []
+        all_frames = sorted(df["Frame"].dropna().astype(int).unique())
+        for frame_num in all_frames:
+            frame_rows = df[df["Frame"] == frame_num]
+            detections = [self._row_to_detection(row) for row in frame_rows.itertuples(index=False)]
+            detections = [det for det in detections if det is not None]
+            _, _, closed = tracker.update(detections, frame_num)
+            closed_tracks.extend(closed)
+
+        for track_id in list(tracker.tracks.keys()):
+            closed_tracks.append(tracker.tracks[track_id])
+            del tracker.tracks[track_id]
+
+        episodes = [track for track in closed_tracks if track.positions]
+        self.tracks = self._post_process_tracks(episodes)
+
+    @property
+    def _tracking_max_distance(self) -> float:
+        """Largest jump between two consecutive detections of one ball."""
+        return self._scaled_max_distance * self._ball_frame_step
+
+    def _row_to_detection(self, row: Any) -> Optional[dict[str, float]]:
+        if pd.isna(row.X) or pd.isna(row.Y):
+            return None
+        radius = None
+        if pd.notna(row.RadiusMed6) and row.RadiusMed6 > 0:
+            radius = float(row.RadiusMed6)
+        elif pd.notna(row.Radius) and row.Radius > 0:
+            radius = float(row.Radius)
+        half_size = max(float(DEFAULT_DETECTION_BOX_RADIUS), radius if radius is not None else 0.0)
+        return {
+            "x1": float(row.X) - half_size,
+            "y1": float(row.Y) - half_size,
+            "x2": float(row.X) + half_size,
+            "y2": float(row.Y) + half_size,
+            "confidence": float(row.Visibility) if pd.notna(row.Visibility) else 1.0,
+            "cls_id": 0.0,
+        }
+
+    def _post_process_tracks(self, tracks: Sequence[Track]) -> list[Track]:
+        filtered = [track for track in tracks if track.duration_sec() >= self.config.min_duration_sec]
+        filtered = self._remove_overlapping(filtered)
+        filtered = self._extend_tracks(filtered)
+        filtered = self._merge_overlapping(filtered)
+        filtered = self._split_discontinuous_tracks(filtered)
+        filtered = self._split_blind_gaps(filtered)
+        filtered = self._merge_airborne_reentry_tracks(filtered)
+        filtered = self._merge_contact_split_tracks(filtered)
+        # Splitting can leave fragments shorter than the minimum; merges above
+        # had their chance to reattach them.
+        filtered = [track for track in filtered if track.duration_sec() >= self.config.min_duration_sec]
+        if self._court.enabled:
+            filtered = [track for track in filtered if self._track_crosses_net(track)]
+        return sorted(filtered, key=lambda item: item.start_frame)
+
+    def _remove_overlapping(self, tracks: Sequence[Track]) -> list[Track]:
+        sorted_tracks = sorted(tracks, key=lambda item: item.duration_sec(), reverse=True)
+        chosen: list[Track] = []
+        taken: set[int] = set()
+        for i, track in enumerate(sorted_tracks):
+            if i in taken:
+                continue
+            chosen.append(track)
+            for j, other in enumerate(sorted_tracks):
+                if j <= i or j in taken:
+                    continue
+                if track.start_frame <= other.last_frame and other.start_frame <= track.last_frame:
+                    taken.add(j)
+        return chosen
+
+    def _extend_tracks(self, tracks: Sequence[Track]) -> list[Track]:
+        # This pipeline classifies event boundaries. Artificial extension smears
+        # short technical-return episodes into neighboring rallies and hurts the
+        # state machine, so we keep native tracker boundaries here.
+        return list(tracks)
+
+    def _merge_overlapping(self, tracks: Sequence[Track]) -> list[Track]:
+        merged: list[Track] = []
+        used: set[int] = set()
+        items = sorted(tracks, key=lambda item: item.start_frame)
+        for i, track in enumerate(items):
+            if i in used:
+                continue
+            base = track
+            positions = list(base.positions)
+            used.add(i)
+            for j, other in enumerate(items):
+                if j <= i or j in used:
+                    continue
+                gap = max(0, max(other.start_frame - base.last_frame, base.start_frame - other.last_frame))
+                if gap <= MAX_MERGE_GAP_FRAMES and not (
+                    other.last_frame < base.start_frame or other.start_frame > base.last_frame
+                ):
+                    base.start_frame = min(base.start_frame, other.start_frame)
+                    base.last_frame = max(base.last_frame, other.last_frame)
+                    positions.extend(other.positions)
+                    used.add(j)
+            base.positions = type(base.positions)(sorted(positions, key=lambda item: item[1]), maxlen=base.positions.maxlen)
+            merged.append(base)
+        return merged
+
+    def _split_discontinuous_tracks(self, tracks: Sequence[Track]) -> list[Track]:
+        result: list[Track] = []
+        for track in tracks:
+            positions = sorted(track.positions, key=lambda item: item[1])
+            if not positions:
+                continue
+            chunks: list[list[Any]] = [[positions[0]]]
+            for pos in positions[1:]:
+                prev_frame = int(chunks[-1][-1][1])
+                frame = int(pos[1])
+                if frame - prev_frame > MAX_MERGE_GAP_FRAMES:
+                    chunks.append([pos])
+                else:
+                    chunks[-1].append(pos)
+
+            result.extend(self._tracks_from_chunks(track, chunks))
+        return result
+
+    def _split_blind_gaps(self, tracks: Sequence[Track]) -> list[Track]:
+        """Cuts a track where neither detector sees the ball for a long time."""
+        if not self._player_store.has_ball_detections:
+            return list(tracks)
+
+        # A sparse detector goes blind as long in samples, not in seconds.
+        min_gap = max(2, int(round(self.config.fps * BLIND_GAP_SECONDS * self._ball_frame_step)))
+        result: list[Track] = []
+        for track in tracks:
+            positions = sorted(track.positions, key=lambda item: item[1])
+            if not positions:
+                continue
+            chunks: list[list[Any]] = [[positions[0]]]
+            for pos in positions[1:]:
+                previous_frame = int(chunks[-1][-1][1])
+                frame = int(pos[1])
+                if frame - previous_frame >= min_gap and self._gap_is_blind(previous_frame, frame):
+                    LOG.debug(
+                        "Splitting track %s: no ball seen between frames %s and %s",
+                        track.track_id,
+                        previous_frame,
+                        frame,
+                    )
+                    chunks.append([pos])
+                else:
+                    chunks[-1].append(pos)
+            result.extend(self._tracks_from_chunks(track, chunks))
+        return result
+
+    def _gap_is_blind(self, first_frame: int, second_frame: int) -> bool:
+        for frame in range(first_frame + 1, second_frame):
+            if frame in self._observations_by_frame:
+                return False
+            if self._player_store.ball_at(frame) is not None:
+                return False
+        return True
+
+    @staticmethod
+    def _tracks_from_chunks(track: Track, chunks: Sequence[Sequence[Any]]) -> list[Track]:
+        result: list[Track] = []
+        for index, chunk in enumerate(chunks):
+            child = Track()
+            child.track_id = track.track_id * 1000 + index if len(chunks) > 1 else track.track_id
+            child.reason = track.reason
+            child.fps = track.fps
+            child.positions = type(track.positions)(chunk, maxlen=track.positions.maxlen)
+            child.start_frame = int(chunk[0][1])
+            child.last_frame = int(chunk[-1][1])
+            child.ball_sizes = track.ball_sizes
+            child.prediction = track.prediction
+            result.append(child)
+        return result
+
+    def _merge_airborne_reentry_tracks(self, tracks: Sequence[Track]) -> list[Track]:
+        items = sorted(tracks, key=lambda item: item.start_frame)
+        if not items:
+            return []
+
+        merged: list[Track] = []
+        current = items[0]
+        for candidate in items[1:]:
+            if self._should_merge_airborne_reentry(current, candidate):
+                current = self._combine_tracks(current, candidate)
+            else:
+                merged.append(current)
+                current = candidate
+        merged.append(current)
+        return merged
+
+    def _merge_contact_split_tracks(self, tracks: Sequence[Track]) -> list[Track]:
+        if self._contact_detector is None:
+            return list(tracks)
+
+        items = sorted(tracks, key=lambda item: item.start_frame)
+        if not items:
+            return []
+
+        merged: list[Track] = []
+        current = items[0]
+        for candidate in items[1:]:
+            player = self._contact_between_tracks(current, candidate)
+            if player is not None:
+                LOG.debug(
+                    "Merging tracks %s and %s: contact by player %s in the gap %s-%s",
+                    current.track_id,
+                    candidate.track_id,
+                    player.track_id,
+                    current.last_frame,
+                    candidate.start_frame,
+                )
+                current = self._combine_tracks(current, candidate)
+            else:
+                merged.append(current)
+                current = candidate
+        merged.append(current)
+        return merged
+
+    def _contact_between_tracks(self, first: Track, second: Track):
+        """Player that touched the ball inside the gap between two tracks."""
+        gap_frames = second.start_frame - first.last_frame
+        max_gap_frames = max(
+            1, int(round(self.config.fps * CONTACT_SPLIT_MAX_GAP_SECONDS * self._ball_frame_step))
+        )
+        if not 0 < gap_frames <= max_gap_frames:
+            return None
+
+        first_points = self._sorted_track_points(first)
+        second_points = self._sorted_track_points(second)
+        if not first_points or not second_points:
+            return None
+
+        end = first_points[-1]
+        start = second_points[0]
+        distance = float(np.hypot(end[0] - start[0], end[1] - start[1]))
+        if distance > max(CONTACT_SPLIT_MIN_DISTANCE_PX, self._tracking_max_distance):
+            return None
+
+        for x, y, frame in (end, start):
+            observation = self._observations_by_frame.get(int(frame))
+            radius = (observation.smoothed_radius_px or 0.0) if observation is not None else 0.0
+            player = self._contact_detector.player_within_reach(int(frame), x, y, radius)
+            if player is not None:
+                return player
+        return None
+
+    def _should_merge_airborne_reentry(self, first: Track, second: Track) -> bool:
+        gap_frames = second.start_frame - first.last_frame
+        if gap_frames <= 0:
+            return False
+
+        max_gap_frames = max(1, int(round(self.config.fps * MAX_AIRBORNE_REENTRY_GAP_SECONDS)))
+        if gap_frames > max_gap_frames:
+            return False
+
+        first_points = self._sorted_track_points(first)
+        second_points = self._sorted_track_points(second)
+        if len(first_points) < 2 or len(second_points) < 2:
+            return False
+
+        if not self._track_exits_top(first_points) or not self._track_enters_from_top(second_points):
+            return False
+
+        return self._reentry_matches_flight(first_points, second_points, gap_frames)
+
+    def _reentry_matches_flight(
+        self,
+        first_points: Sequence[tuple[float, float, int]],
+        second_points: Sequence[tuple[float, float, int]],
+        gap_frames: int,
+    ) -> bool:
+        """Checks the ball comes back where its flight out of frame would put it.
+
+        A ball leaving the top of the frame keeps travelling sideways while it is
+        invisible, so a fixed horizontal limit rejects long flights. Extrapolate
+        the exit velocity across the gap instead, and require the ball to fall
+        back roughly as fast as it went up.
+        """
+        exit_x, exit_vx = self._edge_horizontal_motion(first_points, from_end=True)
+        entry_x, _ = self._edge_horizontal_motion(second_points, from_end=False)
+        predicted_x = exit_x + exit_vx * gap_frames
+
+        width = self._resolved_video_width() or int(REFERENCE_VIDEO_WIDTH)
+        tolerance = max(REENTRY_MIN_TOLERANCE_PX, width * REENTRY_TOLERANCE_WIDTH_RATIO)
+        tolerance += abs(exit_vx) * gap_frames * REENTRY_TOLERANCE_DRIFT_RATIO
+        if abs(entry_x - predicted_x) > tolerance:
+            return False
+
+        rising = abs(self._median_vertical_speed(first_points[-min(5, len(first_points)) :]))
+        falling = abs(self._median_vertical_speed(second_points[: min(5, len(second_points))]))
+        if rising <= 1e-6:
+            return False
+        return REENTRY_MIN_SPEED_RATIO <= falling / rising <= REENTRY_MAX_SPEED_RATIO
+
+    @staticmethod
+    def _edge_horizontal_motion(
+        points: Sequence[tuple[float, float, int]],
+        from_end: bool,
+    ) -> tuple[float, float]:
+        """Horizontal position and speed where the ball leaves or re-enters."""
+        edge = points[-min(5, len(points)) :] if from_end else points[: min(5, len(points))]
+        anchor = edge[-1] if from_end else edge[0]
+        if len(edge) < 2:
+            return float(anchor[0]), 0.0
+
+        frames = np.asarray([point[2] for point in edge], dtype=np.float64)
+        xs = np.asarray([point[0] for point in edge], dtype=np.float64)
+        if frames[-1] - frames[0] < 1.0:
+            return float(anchor[0]), 0.0
+        return float(anchor[0]), float(np.polyfit(frames, xs, 1)[0])
+
+    def _track_exits_top(self, points: Sequence[tuple[float, float, int]]) -> bool:
+        top_margin = self._top_reentry_margin()
+        tail = points[-min(5, len(points)) :]
+        if min(point[1] for point in tail) > top_margin:
+            return False
+
+        tail_vy = self._median_vertical_speed(tail)
+        if tail_vy >= -4.0:
+            return False
+
+        return (tail[0][1] - tail[-1][1]) >= 18.0
+
+    def _track_enters_from_top(self, points: Sequence[tuple[float, float, int]]) -> bool:
+        top_margin = self._top_reentry_margin()
+        head = points[: min(5, len(points))]
+        if min(point[1] for point in head) > top_margin:
+            return False
+
+        head_vy = self._median_vertical_speed(head)
+        if head_vy <= 4.0:
+            return False
+
+        return (head[-1][1] - head[0][1]) >= 18.0
+
+    def _top_reentry_margin(self) -> float:
+        height = self._resolved_video_height()
+        if height is None or height <= 0:
+            return 120.0
+        return max(80.0, height * 0.16)
+
+    @staticmethod
+    def _sorted_track_points(track: Track) -> list[tuple[float, float, int]]:
+        points: list[tuple[float, float, int]] = []
+        for pos, frame in sorted(track.positions, key=lambda item: item[1]):
+            points.append((float(pos[0]), float(pos[1]), int(frame)))
+        return points
+
+    @staticmethod
+    def _median_vertical_speed(points: Sequence[tuple[float, float, int]]) -> float:
+        if len(points) < 2:
+            return 0.0
+
+        speeds: list[float] = []
+        for (_, y1, frame1), (_, y2, frame2) in zip(points, points[1:]):
+            dt = max(frame2 - frame1, 1)
+            speeds.append((y2 - y1) / dt)
+        if not speeds:
+            return 0.0
+        return float(np.median(speeds))
+
+    @staticmethod
+    def _combine_tracks(base: Track, other: Track) -> Track:
+        base.start_frame = min(base.start_frame, other.start_frame)
+        base.last_frame = max(base.last_frame, other.last_frame)
+        base.positions = type(base.positions)(
+            sorted([*base.positions, *other.positions], key=lambda item: item[1]),
+            maxlen=base.positions.maxlen,
+        )
+        base.ball_sizes = type(base.ball_sizes)([*base.ball_sizes, *other.ball_sizes], maxlen=base.ball_sizes.maxlen)
+        base.prediction = other.prediction if other.prediction else base.prediction
+        return base
+
+    def _track_crosses_net(self, track: Track) -> bool:
+        observations = self._feature_extractor.build_frame_observations(track, self._observations_by_frame)
+        size_features = self._feature_extractor.compute_ball_size_features(observations)
+        return any(self._feature_extractor.is_above_net(obs, size_features) for obs in observations)
+
+    def _source_basename(self) -> str:
+        source = self.config.csv_path or self.config.players_json_path
+        return resolve_video_basename(source) if source else "unknown"
+
+    def _court_view_payload(
+        self,
+        observations: Sequence[FrameObservation],
+        player_interaction: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Top-down ball/player points already transformed to court metres."""
+        raw_ball_positions: list[tuple[int, float, float]] = []
+        reach_anchors: dict[int, tuple[float, float, int]] = {}
+        for observation in observations:
+            court_x, court_y = self._court.to_court(observation.x, observation.y)
+            if math.isfinite(court_x) and math.isfinite(court_y):
+                raw_ball_positions.append(
+                    (int(observation.frame), float(court_x), float(court_y))
+                )
+            if self._contact_detector is None:
+                continue
+            radius = float(observation.smoothed_radius_px or observation.radius_px or 0.0)
+            candidates = []
+            for box in self._player_store.boxes_near_frame(observation.frame):
+                reach, cost, _ = self._contact_detector._reach_metrics(
+                    box, observation.x, observation.y, radius
+                )
+                if reach > MAX_REACH_RATIO:
+                    continue
+                player_x, _ = self._player_store.court_position(box)
+                side = self._player_store.stable_side(box)
+                if side == "unknown":
+                    side = self._court_side(player_x)
+                candidates.append((cost, side, box))
+            expected_side = self._court_view_expected_side(
+                observation.frame, player_interaction
+            )
+            on_expected_side = [
+                candidate for candidate in candidates if candidate[1] == expected_side
+            ]
+            # Once rally state establishes possession, an overlapping player
+            # on the other side is not a fallback. Leaving this frame without
+            # an anchor lets it be interpolated between plausible same-side
+            # touches instead of teleporting the ball across the net.
+            pool = (
+                on_expected_side
+                if expected_side in {"near", "far", "left", "right"}
+                else candidates
+            )
+            player = min(pool, key=lambda item: item[0])[2] if pool else None
+            if player is None:
+                continue
+            player_x, player_y = self._player_store.court_position(player)
+            if player_x is None or player_y is None:
+                continue
+            if math.isfinite(player_x) and math.isfinite(player_y):
+                reach_anchors[int(observation.frame)] = (
+                    float(player_x),
+                    float(player_y),
+                    int(player.track_id),
+                )
+
+        stabilized = stabilize_court_ball_positions(raw_ball_positions, reach_anchors)
+        ball_positions = [(frame, x, y) for frame, x, y, _, _ in stabilized]
+        motion = court_ball_motion(ball_positions)
+        ball_by_frame = {
+            frame: {
+                "court_x": x,
+                "court_y": y,
+                "projection_source": source,
+                "anchor_player_track_id": player_id,
+            }
+            for frame, x, y, source, player_id in stabilized
+        }
+
+        frames: list[dict[str, Any]] = []
+        if observations:
+            for frame in range(observations[0].frame, observations[-1].frame + 1):
+                players = []
+                for box in self._player_store.boxes_at(frame):
+                    court_x, court_y = self._player_store.court_position(box)
+                    if court_x is None or court_y is None:
+                        continue
+                    if not (math.isfinite(court_x) and math.isfinite(court_y)):
+                        continue
+                    players.append(
+                        {
+                            "track_id": int(box.track_id),
+                            "court_x": float(court_x),
+                            "court_y": float(court_y),
+                            "score": float(box.score),
+                        }
+                    )
+                ball = ball_by_frame.get(frame)
+                direction = motion.get(frame)
+                frames.append(
+                    {
+                        "frame": int(frame),
+                        "ball": ball,
+                        "ball_direction": (
+                            {"dx": direction[0], "dy": direction[1]}
+                            if direction is not None
+                            else None
+                        ),
+                        "players": players,
+                    }
+                )
+
+        return {
+            "coordinate_system": "court_metres",
+            "court_length_m": float(self._court.court_length_m),
+            "court_width_m": float(self._court.court_width_m),
+            "frames": frames,
+        }
+
+    def _court_side(self, court_x: Optional[float]) -> str:
+        if court_x is None:
+            return "unknown"
+        if self._court.camera_position == "sideline":
+            return "left" if court_x < 0 else "right"
+        return "near" if court_x < 0 else "far"
+
+    @staticmethod
+    def _court_view_expected_side(
+        frame: int,
+        player_interaction: Optional[dict[str, Any]],
+    ) -> str:
+        transitions = (
+            ((player_interaction or {}).get("rally_state") or {}).get("transitions")
+            or []
+        )
+        latest = None
+        for transition in transitions:
+            if int(transition.get("frame", -1)) > frame:
+                break
+            latest = transition
+        if latest is None:
+            return "unknown"
+        selected = str(latest.get("selected_side", "unknown"))
+        if (
+            str(latest.get("contact_type")) == "serve"
+            and frame > int(latest.get("frame", frame))
+        ):
+            return {
+                "near": "far",
+                "far": "near",
+                "left": "right",
+                "right": "left",
+            }.get(selected, "unknown")
+        return selected
+
+    def _save_tracks_to_json(self) -> list[TrackAnalysisRecord]:
+        video_basename = self._source_basename()
+        tracks_dir = os.path.join(self.config.output_dir, video_basename, "tracks")
+        os.makedirs(tracks_dir, exist_ok=True)
+        for file_name in os.listdir(tracks_dir):
+            if file_name.startswith("track_") and file_name.endswith(".json"):
+                os.remove(os.path.join(tracks_dir, file_name))
+
+        records = self._build_analysis_records()
+        state_machine = MatchStateMachine(self._court.camera_position)
+        records = state_machine.apply(records)
+
+        for record in records:
+            track = record.track
+            observations = record.observations
+            track_dict = track.to_dict()
+            track_dict["trajectory_analysis"] = record.trajectory_analysis
+            track_dict["rally_features"] = record.rally_features
+            track_dict["rally_classification"] = record.rally_classification
+            track_dict["match_state_before"] = record.state_before
+            track_dict["match_state_after"] = record.state_after
+            track_dict["score_event"] = record.score_event
+            track_dict["player_interaction"] = record.player_interaction
+            track_dict["frame_observations"] = [
+                {
+                    "frame": obs.frame,
+                    "x": obs.x,
+                    "y": obs.y,
+                    "radius_px": obs.radius_px,
+                    "radius_med6_px": obs.smoothed_radius_px,
+                }
+                for obs in observations
+            ]
+            if self._court.enabled and self._court.geometry is not None:
+                track_dict["court_positions"] = [
+                    [list(self._court.to_court(obs.x, obs.y)), obs.frame] for obs in observations
+                ]
+                track_dict["court_view"] = self._court_view_payload(
+                    observations, record.player_interaction
+                )
+                track_dict["court_info"] = {
+                    "image_width": self._court.geometry.image_width,
+                    "image_height": self._court.geometry.image_height,
+                    "court_points_count": len(self._court.geometry.keypoints),
+                    "has_court_transform": self._court.geometry is not None,
+                    "camera_position": self._court.camera_position,
+                    "court_mode": "beach" if self.config.beach else "classic",
+                    "court_length_m": self._court.court_length_m,
+                    "court_width_m": self._court.court_width_m,
+                    "cm_per_px": self._court.cm_per_px_scale,
+                    "net_height_cm": NET_HEIGHT_CM,
+                    "ball_diameter_cm": BALL_DIAMETER_CM,
+                    "player_height_assumed_cm": PLAYER_HEIGHT_CM,
+                    "csv_radius_calibration": {
+                        "radius_lower_px": self._csv_size_calibration.radius_lower_px,
+                        "radius_upper_px": self._csv_size_calibration.radius_upper_px,
+                        "radius_median_px": self._csv_size_calibration.radius_median_px,
+                        "radius_near_far_threshold_px": self._csv_size_calibration.radius_near_far_threshold_px,
+                        "filtered_count": self._csv_size_calibration.filtered_count,
+                    },
+                }
+            track_dict["tracking_scale"] = {
+                "reference_width_px": int(REFERENCE_VIDEO_WIDTH),
+                "frame_width_px": self._resolved_video_width(),
+                "frame_height_px": self._resolved_video_height(),
+                "frame_size_source": (
+                    "cli_override"
+                    if self.config.video_width is not None or self.config.video_height is not None
+                    else "court_json"
+                    if self._court.geometry is not None
+                    else "unknown"
+                ),
+                "frame_width_coeff": self._frame_width_scale,
+                "base_max_distance": self.config.max_distance,
+                "scaled_max_distance": self._scaled_max_distance,
+            }
+            file_path = os.path.join(tracks_dir, f"track_{track.track_id:04d}.json")
+            with open(file_path, "w", encoding="utf-8") as handle:
+                json.dump(track_dict, handle, indent=2, ensure_ascii=False)
+
+        return records
+
+    def _build_analysis_records(self) -> list[TrackAnalysisRecord]:
+        records: list[TrackAnalysisRecord] = []
+        for track in self.tracks:
+            observations = self._feature_extractor.build_frame_observations(track, self._observations_by_frame)
+            player_interaction = self._feature_extractor.analyze_player_interaction(observations)
+            trajectory_analysis, rally_features, rally_classification = self._feature_extractor.extract_features(
+                track, observations, player_interaction
+            )
+            records.append(
+                TrackAnalysisRecord(
+                    track=track,
+                    observations=observations,
+                    trajectory_analysis=trajectory_analysis,
+                    rally_features=rally_features,
+                    rally_classification=rally_classification,
+                    state_before={},
+                    state_after={},
+                    player_interaction=player_interaction,
+                )
+            )
+        return records
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Calculate tracks from CSV with court-aware analysis")
+    parser.add_argument(
+        "--csv_path",
+        type=str,
+        default=None,
+        help="Path to ball.csv. If omitted, the ball is taken from --players_json_path.",
+    )
+    parser.add_argument("--court_json_path", type=str, help="Path to court coordinates JSON file")
+    parser.add_argument(
+        "--players_json_path",
+        type=str,
+        default=None,
+        help="Path to player detections JSON (ravel-vb-predictions). Enables contact analysis.",
+    )
+    parser.add_argument(
+        "--player_score_threshold",
+        type=float,
+        default=DEFAULT_PLAYER_SCORE_THRESHOLD,
+        help="Minimum detection score for a player box to be used",
+    )
+    parser.add_argument(
+        "--ball_score_threshold",
+        type=float,
+        default=DEFAULT_BALL_SCORE_THRESHOLD,
+        help="Minimum detection score for a ball from the players JSON",
+    )
+    parser.add_argument(
+        "--no_ball_fill",
+        action="store_true",
+        help="Do not fill CSV gaps with the ball detected by the players model",
+    )
+    parser.add_argument(
+        "--video_width",
+        type=int,
+        default=None,
+        help="Source video width override. If omitted, uses size from court JSON first.",
+    )
+    parser.add_argument(
+        "--video_height",
+        type=int,
+        default=None,
+        help="Source video height override. If omitted, uses size from court JSON first.",
+    )
+    parser.add_argument("--beach", action="store_true", help="Use beach volleyball court dimensions")
+    parser.add_argument("--output_dir", type=str, default="output", help="Root output directory for JSON")
+    parser.add_argument("--fps", type=float, default=DEFAULT_FPS, help="Frames per second")
+    parser.add_argument("--max_distance", type=float, default=DEFAULT_MAX_DISTANCE, help="Max tracking distance")
+    parser.add_argument(
+        "--min_duration_sec",
+        type=float,
+        default=DEFAULT_MIN_DURATION_SEC,
+        help="Minimum track duration",
+    )
+    parser.add_argument(
+        "--max_x_displacement",
+        type=float,
+        default=DEFAULT_MAX_X_DISPLACEMENT,
+        help="Reserved for compatibility",
+    )
+    parser.add_argument(
+        "--min_y_displacement",
+        type=float,
+        default=DEFAULT_MIN_Y_DISPLACEMENT,
+        help="Reserved for compatibility",
+    )
+    parser.add_argument(
+        "--bounce_frames",
+        type=int,
+        default=DEFAULT_BOUNCE_FRAMES,
+        help="Reserved for compatibility",
+    )
+    parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    if not args.csv_path and not args.players_json_path:
+        parser.error("either --csv_path or --players_json_path is required")
+    setup_logging(args.verbose)
+    config = TrackCalculatorConfig(
+        csv_path=args.csv_path,
+        output_dir=args.output_dir,
+        fps=args.fps,
+        max_distance=args.max_distance,
+        min_duration_sec=args.min_duration_sec,
+        max_x_displacement=args.max_x_displacement,
+        min_y_displacement=args.min_y_displacement,
+        bounce_frames=args.bounce_frames,
+        court_json_path=args.court_json_path,
+        video_width=args.video_width,
+        video_height=args.video_height,
+        beach=args.beach,
+        players_json_path=args.players_json_path,
+        player_score_threshold=args.player_score_threshold,
+        ball_score_threshold=args.ball_score_threshold,
+        use_player_ball=not args.no_ball_fill,
+    )
+    calculator = TrackCalculatorWithCourt(config)
+    calculator.run()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,16 @@
+Motor de IA do Câmera Vôlei = projeto open source "fast-volleyball-tracking-inference"
+Repositório: https://github.com/asigatchov/fast-volleyball-tracking-inference
+Autor: Alexander Sigatchov — Licença MIT (ver LICENSE nesta pasta)
+Commit copiado: d39045eb4ee21622bbcc6645dd07b16efb4bcc93 (Fri Sep 25 15:40:03 2026 +0000)
+Copiado em: 2026-09-30
+
+REGRA: nada nesta pasta é editado à mão. Ela é uma cópia fiel do projeto original
+(src/ inteiro + 3 modelos de models/). O Câmera Vôlei conversa com ela só por
+motor_ia.py. Para atualizar o motor:
+  1. git clone --depth 1 https://github.com/asigatchov/fast-volleyball-tracking-inference.git
+  2. substitua motor_vball/src pela pasta src/ nova e copie os modelos desejados de models/
+  3. atualize o commit acima e rode o app com um vídeo de teste.
+
+Modelos usados:
+  models/VballNetV4c_seq9_grayscale_20260908_213829.onnx  -> "IA precisa" (padrão)
+  models/VballNetFastV1_seq9_grayscale_233_h288_w512.onnx -> "IA rápida" (PC fraco)
